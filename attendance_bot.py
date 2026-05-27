@@ -443,6 +443,124 @@ def missing_or_empty_slots():
     return flat
 
 
+
+def get_team_choices(current: str = ""):
+    current = (current or "").lower().strip()
+
+    try:
+        cursor.execute("""
+            SELECT team_name
+            FROM teams
+            ORDER BY team_name ASC
+        """)
+        teams = [row[0] for row in cursor.fetchall()]
+    except Exception as e:
+        print(f"Team autocomplete DB error: {e}")
+        teams = []
+
+    if not teams:
+        teams = [team for team, seat1, seat2 in DEFAULT_TEAMS]
+
+    choices = []
+    for team_name in teams:
+        if current in team_name.lower():
+            choices.append(app_commands.Choice(name=team_name[:100], value=team_name[:100]))
+
+    return choices[:25]
+
+
+def get_all_seat_choices(current: str = ""):
+    current = (current or "").lower().strip()
+    choices = []
+
+    try:
+        cursor.execute("""
+            SELECT team_name, seat1_name, seat1_driver_id, seat2_name, seat2_driver_id
+            FROM teams
+            ORDER BY team_name ASC
+        """)
+        rows = cursor.fetchall()
+    except Exception as e:
+        print(f"Seat autocomplete DB error: {e}")
+        rows = []
+
+    if not rows:
+        for team_name, seat1, seat2 in DEFAULT_TEAMS:
+            for seat_name in [seat1, seat2]:
+                label = f"{team_name} — {seat_name} — EMPTY"
+                if current in team_name.lower() or current in seat_name.lower():
+                    choices.append(app_commands.Choice(name=label[:100], value=seat_name[:100]))
+        return choices[:25]
+
+    for team_name, seat1_name, seat1_driver_id, seat2_name, seat2_driver_id in rows:
+        for seat_name, driver_id in [(seat1_name, seat1_driver_id), (seat2_name, seat2_driver_id)]:
+            if not seat_name:
+                continue
+            status = "occupied" if driver_id else "EMPTY"
+            label = f"{team_name} — {seat_name} — {status}"
+            if current in team_name.lower() or current in seat_name.lower():
+                choices.append(app_commands.Choice(name=label[:100], value=seat_name[:100]))
+
+    return choices[:25]
+
+
+def get_seat_choices_for_team(team: str | None, current: str = ""):
+    current = (current or "").lower().strip()
+
+    if not team:
+        return get_all_seat_choices(current)
+
+    row = find_team(str(team))
+
+    if not row:
+        for default_team, seat1, seat2 in DEFAULT_TEAMS:
+            if default_team.lower() == str(team).lower():
+                choices = []
+                for seat_name in [seat1, seat2]:
+                    label = f"{seat_name} — EMPTY"
+                    if current in seat_name.lower():
+                        choices.append(app_commands.Choice(name=label[:100], value=seat_name[:100]))
+                return choices[:25]
+        return get_all_seat_choices(current)
+
+    team_name, seat1_name, seat1_driver_id, seat1_driver_name, seat2_name, seat2_driver_id, seat2_driver_name = row
+    choices = []
+
+    for seat_name, driver_id in [(seat1_name, seat1_driver_id), (seat2_name, seat2_driver_id)]:
+        if not seat_name:
+            continue
+        status = "occupied" if driver_id else "EMPTY"
+        label = f"{seat_name} — {status}"
+        if current in seat_name.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=seat_name[:100]))
+
+    if not choices and current == "":
+        return get_all_seat_choices(current)
+
+    return choices[:25]
+
+
+async def team_autocomplete(interaction: discord.Interaction, current: str):
+    try:
+        return get_team_choices(current)
+    except Exception as e:
+        print(f"team_autocomplete error: {e}")
+        return []
+
+
+async def seat_autocomplete(interaction: discord.Interaction, current: str):
+    try:
+        selected_team = getattr(interaction.namespace, "team", None)
+
+        if hasattr(selected_team, "value"):
+            selected_team = selected_team.value
+
+        return get_seat_choices_for_team(selected_team, current)
+    except Exception as e:
+        print(f"seat_autocomplete error: {e}")
+        return []
+
+
 def create_attendance_embed():
     event = get_event()
 
