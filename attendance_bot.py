@@ -15,7 +15,9 @@ TIMEZONE = ZoneInfo("Europe/Prague")
 DB_PATH = os.getenv("ATTENDANCE_DB_PATH", "attendance.db")
 
 intents = discord.Intents.default()
-intents.members = True
+# Nepotřebujeme privileged Server Members Intent.
+# Členové se vybírají přímo přes slash command parametry.
+intents.members = False
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -421,8 +423,12 @@ async def team_remove(interaction: discord.Interaction, team: str):
     await interaction.response.send_message(f"🗑️ Tým **{team}** byl odstraněn.", ephemeral=True)
 
 
-@bot.tree.command(name="teams", description="Ukáže seznam týmů")
+@bot.tree.command(name="teams", description="Admin: ukáže seznam týmů")
 async def teams(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Nemáš oprávnění.", ephemeral=True)
+        return
+
     cursor.execute("""
         SELECT team_name, driver1_id, driver2_id
         FROM teams
@@ -437,7 +443,7 @@ async def teams(interaction: discord.Interaction):
         for team_name, d1_id, d2_id in rows:
             embed.add_field(name=f"🏁 {team_name}", value=f"• <@{d1_id}>\n• <@{d2_id}>", inline=True)
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="attendance_create", description="Admin: vytvořit attendance check")
