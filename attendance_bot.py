@@ -24,6 +24,23 @@ conn = sqlite3.connect(DB_PATH)
 cursor = conn.cursor()
 
 
+DEFAULT_TEAMS = [
+    ("Ferrari", "Fernando Alonso", "Felipe Massa"),
+    ("McLaren", "Lewis Hamilton", "Jenson Button"),
+    ("Williams", "Rubens Barrichello", "Pastor Maldonado"),
+    ("Sauber", "Kamui Kobayashi", "Sergio Perez"),
+    ("Red Bull", "Sebastian Vettel", "Mark Webber"),
+    ("Mercedes", "Michael Schumacher", "Nico Rosberg"),
+    ("Lotus Renault", "Nick Heidfeld", "Vitaly Petrov"),
+    ("Force India", "Adrian Sutil", "Paul di Resta"),
+    ("Toro Rosso", "Sebastien Buemi", "Jaime Alguersuari"),
+    ("Lotus", "Heikki Kovalainen", "Jarno Trulli"),
+    ("Virgin", "Timo Glock", "Jerome dAmbrosio"),
+    ("HRT", "Vitantonio Liuzzi", "Narain Karthikeyan"),
+]
+
+
+
 # -------------------------
 # DATABASE
 # -------------------------
@@ -347,26 +364,79 @@ def missing_or_empty_slots():
 
 def get_team_choices(current: str = ""):
     current = (current or "").lower().strip()
+
     cursor.execute("""
         SELECT team_name
         FROM teams
         ORDER BY team_name ASC
     """)
+    rows = [row[0] for row in cursor.fetchall()]
+
+    # Fallback: if database has no teams yet, still show default 2011 teams.
+    if not rows:
+        rows = [team for team, seat1, seat2 in DEFAULT_TEAMS]
+
     choices = []
-    for (team_name,) in cursor.fetchall():
+    for team_name in rows:
         if current in team_name.lower():
             choices.append(app_commands.Choice(name=team_name[:100], value=team_name[:100]))
+
+    return choices[:25]
+
+
+def get_all_seat_choices(current: str = ""):
+    current = (current or "").lower().strip()
+
+    cursor.execute("""
+        SELECT team_name, seat1_name, seat1_driver_id, seat2_name, seat2_driver_id
+        FROM teams
+        ORDER BY team_name ASC
+    """)
+    rows = cursor.fetchall()
+
+    choices = []
+
+    if not rows:
+        for team_name, seat1, seat2 in DEFAULT_TEAMS:
+            for seat_name in [seat1, seat2]:
+                label = f"{team_name} — {seat_name}"
+                if current in seat_name.lower() or current in team_name.lower():
+                    choices.append(app_commands.Choice(name=label[:100], value=seat_name[:100]))
+        return choices[:25]
+
+    for team_name, seat1_name, seat1_driver_id, seat2_name, seat2_driver_id in rows:
+        for seat_name, driver_id in [(seat1_name, seat1_driver_id), (seat2_name, seat2_driver_id)]:
+            if not seat_name:
+                continue
+
+            status = "occupied" if driver_id else "EMPTY"
+            label = f"{team_name} — {seat_name} — {status}"
+
+            if current in seat_name.lower() or current in team_name.lower():
+                choices.append(app_commands.Choice(name=label[:100], value=seat_name[:100]))
+
     return choices[:25]
 
 
 def get_seat_choices_for_team(team: str | None, current: str = ""):
     current = (current or "").lower().strip()
+
+    # If team is not selected yet, show all seats as fallback.
     if not team:
-        return []
+        return get_all_seat_choices(current)
 
     row = find_team(str(team))
+
+    # Fallback to default 2011 list if team is not saved in DB yet.
     if not row:
-        return []
+        for default_team, seat1, seat2 in DEFAULT_TEAMS:
+            if default_team.lower() == str(team).lower():
+                choices = []
+                for seat_name in [seat1, seat2]:
+                    if current in seat_name.lower():
+                        choices.append(app_commands.Choice(name=f"{seat_name} — EMPTY"[:100], value=seat_name[:100]))
+                return choices[:25]
+        return get_all_seat_choices(current)
 
     team_name, seat1_name, seat1_driver_id, seat1_driver_name, seat2_name, seat2_driver_id, seat2_driver_name = row
     seats = []
@@ -374,11 +444,9 @@ def get_seat_choices_for_team(team: str | None, current: str = ""):
     for seat_name, driver_id in [(seat1_name, seat1_driver_id), (seat2_name, seat2_driver_id)]:
         if not seat_name:
             continue
-        label = seat_name
-        if driver_id:
-            label = f"{seat_name} — occupied"
-        else:
-            label = f"{seat_name} — EMPTY"
+
+        label = f"{seat_name} — occupied" if driver_id else f"{seat_name} — EMPTY"
+
         if current in seat_name.lower():
             seats.append(app_commands.Choice(name=label[:100], value=seat_name[:100]))
 
@@ -391,6 +459,11 @@ async def team_autocomplete(interaction: discord.Interaction, current: str):
 
 async def seat_autocomplete(interaction: discord.Interaction, current: str):
     selected_team = getattr(interaction.namespace, "team", None)
+
+    # Sometimes Discord can pass Choice-like objects.
+    if hasattr(selected_team, "value"):
+        selected_team = selected_team.value
+
     return get_seat_choices_for_team(selected_team, current)
 
 
@@ -711,22 +784,7 @@ async def team_add_2011_defaults(interaction: discord.Interaction, confirm: str)
         await interaction.response.send_message("❌ Type exactly `CONFIRM`.", ephemeral=True)
         return
 
-    defaults = [
-        ("Ferrari", "Fernando Alonso", "Felipe Massa"),
-        ("McLaren", "Lewis Hamilton", "Jenson Button"),
-        ("Williams", "Rubens Barrichello", "Pastor Maldonado"),
-        ("Sauber", "Kamui Kobayashi", "Sergio Perez"),
-        ("Red Bull", "Sebastian Vettel", "Mark Webber"),
-        ("Mercedes", "Michael Schumacher", "Nico Rosberg"),
-        ("Lotus Renault", "Nick Heidfeld", "Vitaly Petrov"),
-        ("Force India", "Adrian Sutil", "Paul di Resta"),
-        ("Toro Rosso", "Sebastien Buemi", "Jaime Alguersuari"),
-        ("Lotus", "Heikki Kovalainen", "Jarno Trulli"),
-        ("Virgin", "Timo Glock", "Jerome dAmbrosio"),
-        ("HRT", "Vitantonio Liuzzi", "Narain Karthikeyan"),
-    ]
-
-    for team, seat1, seat2 in defaults:
+    for team, seat1, seat2 in DEFAULT_TEAMS:
         cursor.execute("""
             INSERT INTO teams
             (team_name, seat1_name, seat1_driver_id, seat1_driver_name, seat2_name, seat2_driver_id, seat2_driver_name)
@@ -1047,6 +1105,197 @@ async def reserve_assign_team_autocomplete(interaction: discord.Interaction, cur
 @reserve_assign.autocomplete("seat")
 async def reserve_assign_seat_autocomplete(interaction: discord.Interaction, current: str):
     return await seat_autocomplete(interaction, current)
+
+
+@bot.tree.command(name="multi_reserve_assign", description="Admin: assign up to 5 reserves at once")
+@app_commands.describe(
+    reserve1="Reserve driver 1",
+    team1="Team for reserve 1",
+    seat1="Seat / IRL driver for reserve 1",
+    reserve2="Reserve driver 2",
+    team2="Team for reserve 2",
+    seat2="Seat / IRL driver for reserve 2",
+    reserve3="Reserve driver 3",
+    team3="Team for reserve 3",
+    seat3="Seat / IRL driver for reserve 3",
+    reserve4="Reserve driver 4",
+    team4="Team for reserve 4",
+    seat4="Seat / IRL driver for reserve 4",
+    reserve5="Reserve driver 5",
+    team5="Team for reserve 5",
+    seat5="Seat / IRL driver for reserve 5"
+)
+async def multi_reserve_assign(
+    interaction: discord.Interaction,
+    reserve1: discord.Member,
+    team1: str,
+    seat1: str,
+    reserve2: discord.Member = None,
+    team2: str = None,
+    seat2: str = None,
+    reserve3: discord.Member = None,
+    team3: str = None,
+    seat3: str = None,
+    reserve4: discord.Member = None,
+    team4: str = None,
+    seat4: str = None,
+    reserve5: discord.Member = None,
+    team5: str = None,
+    seat5: str = None
+):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    entries = [
+        (reserve1, team1, seat1),
+        (reserve2, team2, seat2),
+        (reserve3, team3, seat3),
+        (reserve4, team4, seat4),
+        (reserve5, team5, seat5),
+    ]
+
+    cleaned = []
+
+    for reserve, team, seat in entries:
+        if reserve is None and not team and not seat:
+            continue
+
+        if not (reserve and team and seat):
+            await interaction.response.send_message(
+                "❌ Every reserve assignment must include reserve, team and seat.",
+                ephemeral=True
+            )
+            return
+
+        cleaned.append((reserve, team, seat))
+
+    if not cleaned:
+        await interaction.response.send_message("❌ No reserve assignments provided.", ephemeral=True)
+        return
+
+    event = get_event()
+    race_name = event[0] if event else "Current Race"
+    race_ts = event[1] if event else 0
+
+    assigned = []
+    errors = []
+
+    for reserve, team, seat in cleaned:
+        vote = get_vote(reserve.id)
+
+        if vote != "reserve":
+            errors.append(f"❌ {reserve.mention} is not marked as Reserve.")
+            continue
+
+        seat_data = find_seat(team, seat)
+
+        if not seat_data:
+            errors.append(f"❌ `{team}` / `{seat}` was not found.")
+            continue
+
+        replacing_id = seat_data["driver_id"]
+        replacing_name = seat_data["driver_name"]
+
+        set_seat_driver(seat_data["team_name"], seat_data["slot"], reserve)
+
+        cursor.execute("""
+            INSERT INTO reserve_assignments
+            (reserve_id, reserve_name, team_name, seat_name, replacing_id, replacing_name, created_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            reserve.id,
+            reserve.display_name,
+            seat_data["team_name"],
+            seat_data["seat_name"],
+            replacing_id,
+            replacing_name,
+            now_ts()
+        ))
+        conn.commit()
+
+        assigned.append((reserve, seat_data["team_name"], seat_data["seat_name"], replacing_id))
+
+    if not assigned and errors:
+        await interaction.response.send_message("\n".join(errors)[:1900], ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🟡 MULTI RESERVE ASSIGNMENTS",
+        description=f"Reserve assignments for **{race_name}**.",
+        color=discord.Color.orange()
+    )
+
+    text = ""
+    for reserve, team_name, seat_name, replacing_id in assigned:
+        text += f"🟡 {reserve.mention} → **{team_name}** as **{seat_name}**"
+        if replacing_id:
+            text += f" replacing <@{replacing_id}>"
+        text += "\n"
+
+    embed.add_field(name="Assignments", value=text[:1024] if text else "No assignments.", inline=False)
+
+    if race_ts:
+        embed.add_field(name="Race Start", value=format_dt(race_ts), inline=True)
+
+    if errors:
+        embed.add_field(name="Skipped / Errors", value="\n".join(errors)[:1024], inline=False)
+
+    embed.set_footer(text="CSL Attendance System • FIA Reserve Manager")
+
+    await interaction.response.send_message(embed=embed)
+
+
+# Autocomplete for multi reserve assign
+@multi_reserve_assign.autocomplete("team1")
+async def multi_team1_autocomplete(interaction: discord.Interaction, current: str):
+    return await team_autocomplete(interaction, current)
+
+@multi_reserve_assign.autocomplete("team2")
+async def multi_team2_autocomplete(interaction: discord.Interaction, current: str):
+    return await team_autocomplete(interaction, current)
+
+@multi_reserve_assign.autocomplete("team3")
+async def multi_team3_autocomplete(interaction: discord.Interaction, current: str):
+    return await team_autocomplete(interaction, current)
+
+@multi_reserve_assign.autocomplete("team4")
+async def multi_team4_autocomplete(interaction: discord.Interaction, current: str):
+    return await team_autocomplete(interaction, current)
+
+@multi_reserve_assign.autocomplete("team5")
+async def multi_team5_autocomplete(interaction: discord.Interaction, current: str):
+    return await team_autocomplete(interaction, current)
+
+
+async def multi_seat_autocomplete_for(interaction: discord.Interaction, current: str, team_field: str):
+    selected_team = getattr(interaction.namespace, team_field, None)
+
+    if hasattr(selected_team, "value"):
+        selected_team = selected_team.value
+
+    return get_seat_choices_for_team(selected_team, current)
+
+
+@multi_reserve_assign.autocomplete("seat1")
+async def multi_seat1_autocomplete(interaction: discord.Interaction, current: str):
+    return await multi_seat_autocomplete_for(interaction, current, "team1")
+
+@multi_reserve_assign.autocomplete("seat2")
+async def multi_seat2_autocomplete(interaction: discord.Interaction, current: str):
+    return await multi_seat_autocomplete_for(interaction, current, "team2")
+
+@multi_reserve_assign.autocomplete("seat3")
+async def multi_seat3_autocomplete(interaction: discord.Interaction, current: str):
+    return await multi_seat_autocomplete_for(interaction, current, "team3")
+
+@multi_reserve_assign.autocomplete("seat4")
+async def multi_seat4_autocomplete(interaction: discord.Interaction, current: str):
+    return await multi_seat_autocomplete_for(interaction, current, "team4")
+
+@multi_reserve_assign.autocomplete("seat5")
+async def multi_seat5_autocomplete(interaction: discord.Interaction, current: str):
+    return await multi_seat_autocomplete_for(interaction, current, "team5")
 
 
 if not TOKEN:
