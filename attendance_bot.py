@@ -343,6 +343,57 @@ def missing_or_empty_slots():
     return missing
 
 
+
+
+def get_team_choices(current: str = ""):
+    current = (current or "").lower().strip()
+    cursor.execute("""
+        SELECT team_name
+        FROM teams
+        ORDER BY team_name ASC
+    """)
+    choices = []
+    for (team_name,) in cursor.fetchall():
+        if current in team_name.lower():
+            choices.append(app_commands.Choice(name=team_name[:100], value=team_name[:100]))
+    return choices[:25]
+
+
+def get_seat_choices_for_team(team: str | None, current: str = ""):
+    current = (current or "").lower().strip()
+    if not team:
+        return []
+
+    row = find_team(str(team))
+    if not row:
+        return []
+
+    team_name, seat1_name, seat1_driver_id, seat1_driver_name, seat2_name, seat2_driver_id, seat2_driver_name = row
+    seats = []
+
+    for seat_name, driver_id in [(seat1_name, seat1_driver_id), (seat2_name, seat2_driver_id)]:
+        if not seat_name:
+            continue
+        label = seat_name
+        if driver_id:
+            label = f"{seat_name} — occupied"
+        else:
+            label = f"{seat_name} — EMPTY"
+        if current in seat_name.lower():
+            seats.append(app_commands.Choice(name=label[:100], value=seat_name[:100]))
+
+    return seats[:25]
+
+
+async def team_autocomplete(interaction: discord.Interaction, current: str):
+    return get_team_choices(current)
+
+
+async def seat_autocomplete(interaction: discord.Interaction, current: str):
+    selected_team = getattr(interaction.namespace, "team", None)
+    return get_seat_choices_for_team(selected_team, current)
+
+
 def create_attendance_embed():
     event = get_event()
 
@@ -956,6 +1007,46 @@ async def reserve_assign(interaction: discord.Interaction, reserve: discord.Memb
     embed.set_footer(text="CSL Attendance System • FIA Reserve Manager")
 
     await interaction.response.send_message(embed=embed)
+
+
+
+# -------------------------
+# AUTOCOMPLETE
+# -------------------------
+
+@team_set_driver.autocomplete("team")
+async def team_set_driver_team_autocomplete(interaction: discord.Interaction, current: str):
+    return await team_autocomplete(interaction, current)
+
+
+@team_set_driver.autocomplete("seat")
+async def team_set_driver_seat_autocomplete(interaction: discord.Interaction, current: str):
+    return await seat_autocomplete(interaction, current)
+
+
+@team_remove_driver.autocomplete("team")
+async def team_remove_driver_team_autocomplete(interaction: discord.Interaction, current: str):
+    return await team_autocomplete(interaction, current)
+
+
+@team_remove_driver.autocomplete("seat")
+async def team_remove_driver_seat_autocomplete(interaction: discord.Interaction, current: str):
+    return await seat_autocomplete(interaction, current)
+
+
+@team_remove.autocomplete("team")
+async def team_remove_team_autocomplete(interaction: discord.Interaction, current: str):
+    return await team_autocomplete(interaction, current)
+
+
+@reserve_assign.autocomplete("team")
+async def reserve_assign_team_autocomplete(interaction: discord.Interaction, current: str):
+    return await team_autocomplete(interaction, current)
+
+
+@reserve_assign.autocomplete("seat")
+async def reserve_assign_seat_autocomplete(interaction: discord.Interaction, current: str):
+    return await seat_autocomplete(interaction, current)
 
 
 if not TOKEN:
