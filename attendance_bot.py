@@ -15,8 +15,7 @@ TIMEZONE = ZoneInfo("Europe/Prague")
 DB_PATH = os.getenv("ATTENDANCE_DB_PATH", "attendance.db")
 
 intents = discord.Intents.default()
-# Nepotřebujeme privileged Server Members Intent.
-# Členové se vybírají přímo přes slash command parametry.
+# No privileged intents needed.
 intents.members = False
 
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -24,14 +23,21 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 conn = sqlite3.connect(DB_PATH)
 cursor = conn.cursor()
 
+
+# -------------------------
+# DATABASE
+# -------------------------
+
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS teams (
     team_id INTEGER PRIMARY KEY AUTOINCREMENT,
     team_name TEXT UNIQUE,
-    driver1_id INTEGER,
-    driver1_name TEXT,
-    driver2_id INTEGER,
-    driver2_name TEXT
+    seat1_name TEXT,
+    seat1_driver_id INTEGER,
+    seat1_driver_name TEXT,
+    seat2_name TEXT,
+    seat2_driver_id INTEGER,
+    seat2_driver_name TEXT
 )
 """)
 
@@ -62,6 +68,7 @@ CREATE TABLE IF NOT EXISTS reserve_assignments (
     reserve_id INTEGER,
     reserve_name TEXT,
     team_name TEXT,
+    seat_name TEXT,
     replacing_id INTEGER,
     replacing_name TEXT,
     created_ts INTEGER
@@ -70,6 +77,31 @@ CREATE TABLE IF NOT EXISTS reserve_assignments (
 
 conn.commit()
 
+# Migration from older version
+for column in [
+    "seat1_name TEXT",
+    "seat1_driver_id INTEGER",
+    "seat1_driver_name TEXT",
+    "seat2_name TEXT",
+    "seat2_driver_id INTEGER",
+    "seat2_driver_name TEXT",
+]:
+    try:
+        cursor.execute(f"ALTER TABLE teams ADD COLUMN {column}")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+try:
+    cursor.execute("ALTER TABLE reserve_assignments ADD COLUMN seat_name TEXT")
+    conn.commit()
+except sqlite3.OperationalError:
+    pass
+
+
+# -------------------------
+# HELPERS
+# -------------------------
 
 def is_admin(interaction: discord.Interaction):
     return interaction.user.guild_permissions.administrator
@@ -80,17 +112,23 @@ def now_ts():
 
 
 def parse_race_datetime(date_text: str, time_text: str):
+    """
+    date: 23.5.2026 / 23.05.2026 / 23.5.
+    time: 20:00
+    """
     date_text = date_text.strip()
     time_text = time_text.strip()
+
     parts = date_text.replace("/", ".").split(".")
     parts = [p for p in parts if p]
 
     if len(parts) < 2:
-        raise ValueError("Bad date")
+        raise ValueError("Invalid date format.")
 
     day = int(parts[0])
     month = int(parts[1])
     year = int(parts[2]) if len(parts) >= 3 else datetime.now(TIMEZONE).year
+
     hour, minute = map(int, time_text.split(":"))
 
     dt = datetime(year, month, day, hour, minute, tzinfo=TIMEZONE)
@@ -103,10 +141,13 @@ def format_dt(ts: int):
 
 def format_left(ts: int):
     remaining = ts - now_ts()
+
     if remaining <= 0:
         return "00h 00m"
+
     hours = remaining // 3600
     minutes = (remaining % 3600) // 60
+
     return f"{hours:02d}h {minutes:02d}m"
 
 
@@ -154,11 +195,21 @@ def set_vote(user: discord.Member | discord.User, status: str):
 
 
 def status_emoji(status: str):
-    return {"yes": "✅", "no": "❌", "maybe": "❓", "reserve": "🟡"}.get(status, "❔")
+    return {
+        "yes": "✅",
+        "no": "❌",
+        "maybe": "❓",
+        "reserve": "🟡"
+    }.get(status, "❔")
 
 
 def status_name(status: str):
-    return {"yes": "Jedu", "no": "Nejedu", "maybe": "Nevím", "reserve": "Rezerva"}.get(status, "Unknown")
+    return {
+        "yes": "Racing",
+        "no": "Not Racing",
+        "maybe": "Maybe",
+        "reserve": "Reserve"
+    }.get(status, "Unknown")
 
 
 def get_status_users(status: str):
@@ -173,39 +224,132 @@ def get_status_users(status: str):
 
 def format_user_list(rows):
     if not rows:
-        return "Nikdo"
+        return "Nobody"
+
     text = ""
     for index, (user_id, user_name) in enumerate(rows, start=1):
         text += f"**{index}.** <@{user_id}>\n"
+
     return text[:1024]
 
 
-def team_missing_slots():
+def seat_value(driver_id, driver_name):
+    if driver_id:
+        return f"<@{driver_id}>"
+    return "`EMPTY`"
+
+
+def find_team(team: str):
     cursor.execute("""
-        SELECT team_name, driver1_id, driver1_name, driver2_id, driver2_name
+        SELECT team_name, seat1_name, seat1_driver_id, seat1_driver_name, seat2_name, seat2_driver_id, seat2_driver_name
+        FROM teams
+        WHERE LOWER(team_name) = LOWER(?)
+    """, (team,))
+    return cursor.fetchone()
+
+
+def find_seat(team: str, seat: str):
+    row = find_team(team)
+    if not row:
+        return None
+
+    team_name, seat1_name, seat1_driver_id, seat1_driver_name, seat2_name, seat2_driver_id, seat2_driver_name = row
+    seat_clean = seat.strip().lower()
+
+    if seat1_name and seat1_name.strip().lower() == seat_clean:
+        return {
+            "team_name": team_name,
+            "slot": 1,
+            "seat_name": seat1_name,
+            "driver_id": seat1_driver_id,
+            "driver_name": seat1_driver_name
+        }
+
+    if seat2_name and seat2_name.strip().lower() == seat_clean:
+        return {
+            "team_name": team_name,
+            "slot": 2,
+            "seat_name": seat2_name,
+            "driver_id": seat2_driver_id,
+            "driver_name": seat2_driver_name
+        }
+
+    return None
+
+
+def set_seat_driver(team_name: str, slot: int, member: discord.Member | None):
+    if slot == 1:
+        if member:
+            cursor.execute("""
+                UPDATE teams
+                SET seat1_driver_id = ?, seat1_driver_name = ?
+                WHERE LOWER(team_name) = LOWER(?)
+            """, (member.id, member.display_name, team_name))
+        else:
+            cursor.execute("""
+                UPDATE teams
+                SET seat1_driver_id = NULL, seat1_driver_name = NULL
+                WHERE LOWER(team_name) = LOWER(?)
+            """, (team_name,))
+    elif slot == 2:
+        if member:
+            cursor.execute("""
+                UPDATE teams
+                SET seat2_driver_id = ?, seat2_driver_name = ?
+                WHERE LOWER(team_name) = LOWER(?)
+            """, (member.id, member.display_name, team_name))
+        else:
+            cursor.execute("""
+                UPDATE teams
+                SET seat2_driver_id = NULL, seat2_driver_name = NULL
+                WHERE LOWER(team_name) = LOWER(?)
+            """, (team_name,))
+    conn.commit()
+
+
+def missing_or_empty_slots():
+    """
+    Slots that can be filled by reserves:
+    - empty seat
+    - driver voted no
+    - driver voted maybe
+    - driver did not vote
+    """
+    cursor.execute("""
+        SELECT team_name, seat1_name, seat1_driver_id, seat1_driver_name, seat2_name, seat2_driver_id, seat2_driver_name
         FROM teams
         ORDER BY team_name ASC
     """)
     teams = cursor.fetchall()
+
     missing = []
 
-    for team_name, d1_id, d1_name, d2_id, d2_name in teams:
-        for driver_id, driver_name in [(d1_id, d1_name), (d2_id, d2_name)]:
-            if not driver_id:
+    for team_name, s1, d1_id, d1_name, s2, d2_id, d2_name in teams:
+        for slot, seat_name, driver_id, driver_name in [
+            (1, s1, d1_id, d1_name),
+            (2, s2, d2_id, d2_name)
+        ]:
+            if not seat_name:
                 continue
+
+            if not driver_id:
+                missing.append((team_name, slot, seat_name, None, None, "empty"))
+                continue
+
             vote = get_vote(driver_id)
             if vote in [None, "no", "maybe"]:
-                missing.append((team_name, driver_id, driver_name))
+                missing.append((team_name, slot, seat_name, driver_id, driver_name, vote or "no_response"))
 
     return missing
 
 
 def create_attendance_embed():
     event = get_event()
+
     if not event:
         return discord.Embed(
             title="🏁 CSL ATTENDANCE",
-            description="Žádný attendance check není vytvořený.",
+            description="No attendance check has been created.",
             color=discord.Color.red()
         )
 
@@ -214,18 +358,55 @@ def create_attendance_embed():
 
     embed = discord.Embed(
         title=f"🏁 CSL ATTENDANCE — {race_name}",
-        description="Klikni na tlačítko podle toho, jestli jedeš závod.",
+        description="Click the button based on your race availability.",
         color=discord.Color.green() if is_open == 1 else discord.Color.red()
     )
 
-    embed.add_field(name="📅 Race start", value=f"{format_dt(race_ts)}\n**Za {format_left(race_ts)}**", inline=True)
-    embed.add_field(name="🟡 Reserve check", value=f"{format_dt(reserve_ts)}\n**Za {format_left(reserve_ts)}**", inline=True)
+    embed.add_field(name="📅 Race Start", value=f"{format_dt(race_ts)}\n**In {format_left(race_ts)}**", inline=True)
+    embed.add_field(name="🟡 Reserve Check", value=f"{format_dt(reserve_ts)}\n**In {format_left(reserve_ts)}**", inline=True)
     embed.add_field(name="📊 Status", value=f"**{status}**", inline=True)
-    embed.add_field(name="✅ Jedu", value=format_user_list(get_status_users("yes")), inline=True)
-    embed.add_field(name="❌ Nejedu", value=format_user_list(get_status_users("no")), inline=True)
-    embed.add_field(name="❓ Nevím", value=format_user_list(get_status_users("maybe")), inline=True)
-    embed.add_field(name="🟡 Rezerva", value=format_user_list(get_status_users("reserve")), inline=False)
+
+    embed.add_field(name="✅ Racing", value=format_user_list(get_status_users("yes")), inline=True)
+    embed.add_field(name="❌ Not Racing", value=format_user_list(get_status_users("no")), inline=True)
+    embed.add_field(name="❓ Maybe", value=format_user_list(get_status_users("maybe")), inline=True)
+    embed.add_field(name="🟡 Reserves", value=format_user_list(get_status_users("reserve")), inline=False)
+
     embed.set_footer(text="CSL Attendance System • FIA Reserve Manager")
+    return embed
+
+
+def create_teams_embed():
+    cursor.execute("""
+        SELECT team_name, seat1_name, seat1_driver_id, seat2_name, seat2_driver_id
+        FROM teams
+        ORDER BY team_name ASC
+    """)
+    rows = cursor.fetchall()
+
+    embed = discord.Embed(
+        title="🏎️ CSL TEAM DATABASE",
+        color=discord.Color.blurple()
+    )
+
+    if not rows:
+        embed.description = "No teams have been saved yet."
+        return embed
+
+    for team_name, seat1_name, seat1_driver_id, seat2_name, seat2_driver_id in rows:
+        value = ""
+
+        if seat1_name:
+            value += f"• **{seat1_name}** → {seat_value(seat1_driver_id, None)}\n"
+
+        if seat2_name:
+            value += f"• **{seat2_name}** → {seat_value(seat2_driver_id, None)}\n"
+
+        if not value:
+            value = "`No seats configured`"
+
+        embed.add_field(name=f"🏁 {team_name}", value=value, inline=False)
+
+    embed.set_footer(text="CSL Attendance System • FIA Team Manager")
     return embed
 
 
@@ -235,49 +416,56 @@ class AttendanceView(discord.ui.View):
 
     async def handle_vote(self, interaction: discord.Interaction, status: str):
         event = get_event()
+
         if not event:
-            await interaction.response.send_message("❌ Žádný attendance check není aktivní.", ephemeral=True)
+            await interaction.response.send_message("❌ No attendance check is active.", ephemeral=True)
             return
 
         race_name, race_ts, reserve_ts, channel_id, message_id, is_open, reserves_assigned = event
+
         if is_open != 1:
-            await interaction.response.send_message("❌ Attendance check je uzavřený.", ephemeral=True)
+            await interaction.response.send_message("❌ Attendance check is closed.", ephemeral=True)
             return
 
         set_vote(interaction.user, status)
+
         await interaction.response.send_message(
-            f"{status_emoji(status)} Tvoje odpověď byla nastavena na **{status_name(status)}**.",
+            f"{status_emoji(status)} Your status has been set to **{status_name(status)}**.",
             ephemeral=True
         )
+
         await update_attendance_message()
 
-    @discord.ui.button(label="Jedu", emoji="✅", style=discord.ButtonStyle.green, custom_id="attendance_yes")
+    @discord.ui.button(label="Racing", emoji="✅", style=discord.ButtonStyle.green, custom_id="attendance_yes")
     async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.handle_vote(interaction, "yes")
 
-    @discord.ui.button(label="Nejedu", emoji="❌", style=discord.ButtonStyle.red, custom_id="attendance_no")
+    @discord.ui.button(label="Not Racing", emoji="❌", style=discord.ButtonStyle.red, custom_id="attendance_no")
     async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.handle_vote(interaction, "no")
 
-    @discord.ui.button(label="Nevím", emoji="❓", style=discord.ButtonStyle.gray, custom_id="attendance_maybe")
+    @discord.ui.button(label="Maybe", emoji="❓", style=discord.ButtonStyle.gray, custom_id="attendance_maybe")
     async def maybe(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.handle_vote(interaction, "maybe")
 
-    @discord.ui.button(label="Rezerva", emoji="🟡", style=discord.ButtonStyle.blurple, custom_id="attendance_reserve")
+    @discord.ui.button(label="Reserve", emoji="🟡", style=discord.ButtonStyle.blurple, custom_id="attendance_reserve")
     async def reserve(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.handle_vote(interaction, "reserve")
 
 
 async def update_attendance_message():
     event = get_event()
+
     if not event:
         return
 
     race_name, race_ts, reserve_ts, channel_id, message_id, is_open, reserves_assigned = event
+
     if not channel_id or not message_id:
         return
 
     channel = bot.get_channel(channel_id)
+
     if not channel:
         return
 
@@ -288,14 +476,16 @@ async def update_attendance_message():
         print(f"Attendance update error: {e}")
 
 
-async def assign_reserves(channel: discord.TextChannel | discord.Thread, manual=False):
+async def auto_assign_reserves(channel: discord.TextChannel | discord.Thread):
     event = get_event()
+
     if not event:
-        return "❌ Žádný attendance check není aktivní."
+        return
 
     race_name, race_ts, reserve_ts, channel_id, message_id, is_open, reserves_assigned = event
-    if reserves_assigned == 1 and not manual:
-        return "ℹ️ Rezervy už byly automaticky přiřazeny."
+
+    if reserves_assigned == 1:
+        return
 
     cursor.execute("""
         SELECT user_id, user_name
@@ -304,76 +494,85 @@ async def assign_reserves(channel: discord.TextChannel | discord.Thread, manual=
         ORDER BY user_name ASC
     """)
     reserves = cursor.fetchall()
-    missing = team_missing_slots()
 
-    if not reserves:
-        return "ℹ️ Nejsou žádní rezervní jezdci."
-    if not missing:
-        return "✅ Všechny týmy jsou kompletní. Rezervy nejsou potřeba."
+    slots = missing_or_empty_slots()
+
+    if not reserves or not slots:
+        cursor.execute("UPDATE attendance_events SET reserves_assigned = 1 WHERE id = 1")
+        conn.commit()
+        return
 
     assignments = []
     used_reserves = set()
 
-    for team_name, missing_id, missing_name in missing:
-        reserve = None
+    for team_name, slot, seat_name, replacing_id, replacing_name, reason in slots:
+        chosen = None
+
         for reserve_id, reserve_name in reserves:
-            if reserve_id not in used_reserves and reserve_id != missing_id:
-                reserve = (reserve_id, reserve_name)
+            if reserve_id not in used_reserves:
+                chosen = (reserve_id, reserve_name)
                 break
-        if not reserve:
+
+        if not chosen:
             break
 
-        reserve_id, reserve_name = reserve
+        reserve_id, reserve_name = chosen
         used_reserves.add(reserve_id)
+
+        replacing_text = replacing_name if replacing_id else None
 
         cursor.execute("""
             INSERT INTO reserve_assignments
-            (reserve_id, reserve_name, team_name, replacing_id, replacing_name, created_ts)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (reserve_id, reserve_name, team_name, missing_id, missing_name, now_ts()))
+            (reserve_id, reserve_name, team_name, seat_name, replacing_id, replacing_name, created_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (reserve_id, reserve_name, team_name, seat_name, replacing_id, replacing_text, now_ts()))
         conn.commit()
-        assignments.append((reserve_id, reserve_name, team_name, missing_id, missing_name))
 
-    if not assignments:
-        return "ℹ️ Nepodařilo se vytvořit žádné přiřazení."
+        assignments.append((reserve_id, team_name, seat_name, replacing_id))
 
     cursor.execute("UPDATE attendance_events SET reserves_assigned = 1 WHERE id = 1")
     conn.commit()
 
+    if not assignments:
+        return
+
     embed = discord.Embed(
-        title="🟡 CSL RESERVE ASSIGNMENTS",
-        description=f"Automatické přiřazení rezerv pro **{race_name}**.",
+        title="🟡 CSL AUTO RESERVE ASSIGNMENTS",
+        description=f"Automatic reserve assignment for **{race_name}**.",
         color=discord.Color.orange()
     )
 
     text = ""
-    for reserve_id, reserve_name, team_name, missing_id, missing_name in assignments:
-        text += f"🟡 <@{reserve_id}> → **{team_name}** místo <@{missing_id}>\n"
+    for reserve_id, team_name, seat_name, replacing_id in assignments:
+        text += f"🟡 <@{reserve_id}> → **{team_name}** as **{seat_name}**"
+        if replacing_id:
+            text += f" replacing <@{replacing_id}>"
+        text += "\n"
 
     embed.add_field(name="📋 Assignments", value=text[:1024], inline=False)
-    embed.add_field(name="🏁 Race", value=f"**{race_name}**", inline=True)
-    embed.add_field(name="📅 Start", value=format_dt(race_ts), inline=True)
-    embed.set_footer(text="CSL Attendance System • FIA Reserve Manager")
+    embed.add_field(name="📅 Race Start", value=format_dt(race_ts), inline=True)
+    embed.set_footer(text="CSL Attendance System • Auto Reserve Manager")
 
     await channel.send(embed=embed)
-    return f"✅ Přiřazeno rezerv: **{len(assignments)}**"
 
 
 @tasks.loop(seconds=60)
 async def reserve_checker():
     event = get_event()
+
     if not event:
         return
 
     race_name, race_ts, reserve_ts, channel_id, message_id, is_open, reserves_assigned = event
+
     if reserves_assigned == 1:
         return
 
     if reserve_ts != 0 and now_ts() >= reserve_ts:
         channel = bot.get_channel(channel_id)
+
         if channel:
-            result = await assign_reserves(channel, manual=False)
-            print(result)
+            await auto_assign_reserves(channel)
 
 
 @bot.event
@@ -387,136 +586,274 @@ async def on_ready():
         reserve_checker.start()
 
 
-@bot.tree.command(name="team_add", description="Admin: přidat nebo upravit tým")
-@app_commands.describe(team="Název týmu", driver1="První jezdec", driver2="Druhý jezdec")
-async def team_add(interaction: discord.Interaction, team: str, driver1: discord.Member, driver2: discord.Member):
+# -------------------------
+# TEAM COMMANDS
+# -------------------------
+
+@bot.tree.command(name="team_edit", description="Admin: create or edit a team with IRL seats")
+@app_commands.describe(
+    team="Team name",
+    seat1_name="IRL driver / seat 1, e.g. Michael Schumacher",
+    seat1_driver="Discord driver for seat 1, optional",
+    seat2_name="IRL driver / seat 2, e.g. Nico Rosberg",
+    seat2_driver="Discord driver for seat 2, optional"
+)
+async def team_edit(
+    interaction: discord.Interaction,
+    team: str,
+    seat1_name: str,
+    seat1_driver: discord.Member = None,
+    seat2_name: str = None,
+    seat2_driver: discord.Member = None
+):
     if not is_admin(interaction):
-        await interaction.response.send_message("❌ Nemáš oprávnění.", ephemeral=True)
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
         return
 
+    seat1_driver_id = seat1_driver.id if seat1_driver else None
+    seat1_driver_name = seat1_driver.display_name if seat1_driver else None
+    seat2_driver_id = seat2_driver.id if seat2_driver else None
+    seat2_driver_name = seat2_driver.display_name if seat2_driver else None
+
     cursor.execute("""
-        INSERT INTO teams (team_name, driver1_id, driver1_name, driver2_id, driver2_name)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO teams
+        (team_name, seat1_name, seat1_driver_id, seat1_driver_name, seat2_name, seat2_driver_id, seat2_driver_name)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(team_name) DO UPDATE SET
-            driver1_id = excluded.driver1_id,
-            driver1_name = excluded.driver1_name,
-            driver2_id = excluded.driver2_id,
-            driver2_name = excluded.driver2_name
-    """, (team, driver1.id, driver1.display_name, driver2.id, driver2.display_name))
+            seat1_name = excluded.seat1_name,
+            seat1_driver_id = excluded.seat1_driver_id,
+            seat1_driver_name = excluded.seat1_driver_name,
+            seat2_name = excluded.seat2_name,
+            seat2_driver_id = excluded.seat2_driver_id,
+            seat2_driver_name = excluded.seat2_driver_name
+    """, (
+        team,
+        seat1_name,
+        seat1_driver_id,
+        seat1_driver_name,
+        seat2_name,
+        seat2_driver_id,
+        seat2_driver_name
+    ))
     conn.commit()
 
-    await interaction.response.send_message(
-        f"✅ Tým **{team}** uložen:\n• {driver1.display_name}\n• {driver2.display_name}",
-        ephemeral=True
+    embed = discord.Embed(
+        title="✅ Team saved",
+        color=discord.Color.green()
     )
-
-
-@bot.tree.command(name="team_remove", description="Admin: odstranit tým")
-@app_commands.describe(team="Název týmu")
-async def team_remove(interaction: discord.Interaction, team: str):
-    if not is_admin(interaction):
-        await interaction.response.send_message("❌ Nemáš oprávnění.", ephemeral=True)
-        return
-
-    cursor.execute("DELETE FROM teams WHERE LOWER(team_name) = LOWER(?)", (team,))
-    conn.commit()
-    await interaction.response.send_message(f"🗑️ Tým **{team}** byl odstraněn.", ephemeral=True)
-
-
-@bot.tree.command(name="teams", description="Admin: ukáže seznam týmů")
-async def teams(interaction: discord.Interaction):
-    if not is_admin(interaction):
-        await interaction.response.send_message("❌ Nemáš oprávnění.", ephemeral=True)
-        return
-
-    cursor.execute("""
-        SELECT team_name, driver1_id, driver2_id
-        FROM teams
-        ORDER BY team_name ASC
-    """)
-    rows = cursor.fetchall()
-
-    embed = discord.Embed(title="🏎️ CSL TEAMS", color=discord.Color.blurple())
-    if not rows:
-        embed.description = "Zatím nejsou nastavené žádné týmy."
-    else:
-        for team_name, d1_id, d2_id in rows:
-            embed.add_field(name=f"🏁 {team_name}", value=f"• <@{d1_id}>\n• <@{d2_id}>", inline=True)
+    embed.add_field(name=f"🏁 {team}", value=(
+        f"• **{seat1_name}** → {seat_value(seat1_driver_id, seat1_driver_name)}\n"
+        f"• **{seat2_name or 'Seat 2'}** → {seat_value(seat2_driver_id, seat2_driver_name)}"
+    ), inline=False)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="attendance_create", description="Admin: vytvořit attendance check")
-@app_commands.describe(
-    race="Název závodu, např. Race 16 - Surfers Paradise 🇦🇺",
-    date="Datum, např. 23.5.2026",
-    time_text="Čas závodu, např. 20:00",
-    reserve_minutes_before="Kolik minut před závodem přiřadit rezervy, např. 60"
-)
-async def attendance_create(interaction: discord.Interaction, race: str, date: str, time_text: str, reserve_minutes_before: int = 60):
+@bot.tree.command(name="team_add_2011_defaults", description="Admin: add default 2011 team seats as EMPTY")
+@app_commands.describe(confirm="Type CONFIRM")
+async def team_add_2011_defaults(interaction: discord.Interaction, confirm: str):
     if not is_admin(interaction):
-        await interaction.response.send_message("❌ Nemáš oprávnění.", ephemeral=True)
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    if confirm != "CONFIRM":
+        await interaction.response.send_message("❌ Type exactly `CONFIRM`.", ephemeral=True)
+        return
+
+    defaults = [
+        ("Ferrari", "Fernando Alonso", "Felipe Massa"),
+        ("McLaren", "Lewis Hamilton", "Jenson Button"),
+        ("Williams", "Rubens Barrichello", "Pastor Maldonado"),
+        ("Sauber", "Kamui Kobayashi", "Sergio Perez"),
+        ("Red Bull", "Sebastian Vettel", "Mark Webber"),
+        ("Mercedes", "Michael Schumacher", "Nico Rosberg"),
+        ("Lotus Renault", "Nick Heidfeld", "Vitaly Petrov"),
+        ("Force India", "Adrian Sutil", "Paul di Resta"),
+        ("Toro Rosso", "Sebastien Buemi", "Jaime Alguersuari"),
+        ("Lotus", "Heikki Kovalainen", "Jarno Trulli"),
+        ("Virgin", "Timo Glock", "Jerome dAmbrosio"),
+        ("HRT", "Vitantonio Liuzzi", "Narain Karthikeyan"),
+    ]
+
+    for team, seat1, seat2 in defaults:
+        cursor.execute("""
+            INSERT INTO teams
+            (team_name, seat1_name, seat1_driver_id, seat1_driver_name, seat2_name, seat2_driver_id, seat2_driver_name)
+            VALUES (?, ?, NULL, NULL, ?, NULL, NULL)
+            ON CONFLICT(team_name) DO UPDATE SET
+                seat1_name = excluded.seat1_name,
+                seat2_name = excluded.seat2_name
+        """, (team, seat1, seat2))
+
+    conn.commit()
+
+    await interaction.response.send_message("✅ Default 2011 team seats have been added as EMPTY.", ephemeral=True)
+
+
+@bot.tree.command(name="team_set_driver", description="Admin: set Discord driver for a specific team seat")
+@app_commands.describe(
+    team="Team name",
+    seat="IRL driver / seat name",
+    driver="Discord driver"
+)
+async def team_set_driver(interaction: discord.Interaction, team: str, seat: str, driver: discord.Member):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    seat_data = find_seat(team, seat)
+
+    if not seat_data:
+        await interaction.response.send_message("❌ Team or seat not found.", ephemeral=True)
+        return
+
+    set_seat_driver(seat_data["team_name"], seat_data["slot"], driver)
+
+    await interaction.response.send_message(
+        f"✅ **{driver.display_name}** assigned to **{seat_data['team_name']}** as **{seat_data['seat_name']}**.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="team_remove_driver", description="Admin: remove Discord driver from a specific seat")
+@app_commands.describe(team="Team name", seat="IRL driver / seat name")
+async def team_remove_driver(interaction: discord.Interaction, team: str, seat: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    seat_data = find_seat(team, seat)
+
+    if not seat_data:
+        await interaction.response.send_message("❌ Team or seat not found.", ephemeral=True)
+        return
+
+    old_driver_id = seat_data["driver_id"]
+    set_seat_driver(seat_data["team_name"], seat_data["slot"], None)
+
+    if old_driver_id:
+        text = f"✅ <@{old_driver_id}> removed from **{seat_data['team_name']}** as **{seat_data['seat_name']}**."
+    else:
+        text = f"ℹ️ Seat **{seat_data['seat_name']}** in **{seat_data['team_name']}** was already EMPTY."
+
+    await interaction.response.send_message(text, ephemeral=True)
+
+
+@bot.tree.command(name="team_remove", description="Admin: delete a full team")
+@app_commands.describe(team="Team name")
+async def team_remove(interaction: discord.Interaction, team: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    cursor.execute("DELETE FROM teams WHERE LOWER(team_name) = LOWER(?)", (team,))
+    conn.commit()
+
+    await interaction.response.send_message(f"🗑️ Team **{team}** has been deleted.", ephemeral=True)
+
+
+@bot.tree.command(name="team_clear", description="Admin: delete all teams")
+@app_commands.describe(confirm="Type RESET")
+async def team_clear(interaction: discord.Interaction, confirm: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    if confirm != "RESET":
+        await interaction.response.send_message("❌ Type exactly `RESET`.", ephemeral=True)
+        return
+
+    cursor.execute("DELETE FROM teams")
+    conn.commit()
+
+    await interaction.response.send_message("🗑️ All teams have been deleted.", ephemeral=True)
+
+
+@bot.tree.command(name="teams", description="Admin: show team database")
+async def teams(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(embed=create_teams_embed(), ephemeral=True)
+
+
+# -------------------------
+# ATTENDANCE COMMANDS
+# -------------------------
+
+@bot.tree.command(name="attendance_create", description="Admin: create attendance check")
+@app_commands.describe(
+    race="Race name, e.g. Race 16 - Surfers Paradise 🇦🇺",
+    date="Date, e.g. 23.5.2026",
+    time_text="Race time, e.g. 20:00",
+    reserve_minutes_before="When reserve assignment happens, e.g. 60"
+)
+async def attendance_create(
+    interaction: discord.Interaction,
+    race: str,
+    date: str,
+    time_text: str,
+    reserve_minutes_before: int = 60
+):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
         return
 
     try:
         race_ts = parse_race_datetime(date, time_text)
     except Exception:
-        await interaction.response.send_message("❌ Špatný formát data nebo času. Použij např. `23.5.2026` a `20:00`.", ephemeral=True)
+        await interaction.response.send_message("❌ Invalid date or time format. Use `23.5.2026` and `20:00`.", ephemeral=True)
         return
 
     reserve_ts = race_ts - reserve_minutes_before * 60
+
     cursor.execute("DELETE FROM attendance_votes")
     cursor.execute("DELETE FROM reserve_assignments")
     conn.commit()
 
     set_event(race, race_ts, reserve_ts, interaction.channel.id, 0, 1, 0)
+
     await interaction.response.send_message(embed=create_attendance_embed(), view=AttendanceView())
     msg = await interaction.original_response()
+
     set_event(race, race_ts, reserve_ts, msg.channel.id, msg.id, 1, 0)
 
 
-@bot.tree.command(name="attendance_status", description="Ukáže attendance status")
+@bot.tree.command(name="attendance_status", description="Show attendance status")
 async def attendance_status(interaction: discord.Interaction):
     await interaction.response.send_message(embed=create_attendance_embed())
 
 
-@bot.tree.command(name="attendance_close", description="Admin: uzavřít attendance check")
+@bot.tree.command(name="attendance_close", description="Admin: close attendance check")
 async def attendance_close(interaction: discord.Interaction):
     if not is_admin(interaction):
-        await interaction.response.send_message("❌ Nemáš oprávnění.", ephemeral=True)
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
         return
 
     event = get_event()
+
     if not event:
-        await interaction.response.send_message("❌ Žádný attendance check není aktivní.", ephemeral=True)
+        await interaction.response.send_message("❌ No attendance check is active.", ephemeral=True)
         return
 
     race_name, race_ts, reserve_ts, channel_id, message_id, is_open, reserves_assigned = event
+
     set_event(race_name, race_ts, reserve_ts, channel_id, message_id, 0, reserves_assigned)
     await update_attendance_message()
-    await interaction.response.send_message("🔒 Attendance check byl uzavřen.", ephemeral=True)
+
+    await interaction.response.send_message("🔒 Attendance check has been closed.", ephemeral=True)
 
 
-@bot.tree.command(name="reserve_assign", description="Admin: ručně přiřadit rezervy")
-async def reserve_assign(interaction: discord.Interaction):
-    if not is_admin(interaction):
-        await interaction.response.send_message("❌ Nemáš oprávnění.", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    result = await assign_reserves(interaction.channel, manual=True)
-    await interaction.followup.send(result, ephemeral=True)
-
-
-@bot.tree.command(name="attendance_reset", description="Admin: reset attendance odpovědí")
-@app_commands.describe(confirm="Napiš RESET pro potvrzení")
+@bot.tree.command(name="attendance_reset", description="Admin: reset attendance votes")
+@app_commands.describe(confirm="Type RESET")
 async def attendance_reset(interaction: discord.Interaction, confirm: str):
     if not is_admin(interaction):
-        await interaction.response.send_message("❌ Nemáš oprávnění.", ephemeral=True)
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
         return
 
     if confirm != "RESET":
-        await interaction.response.send_message("❌ Pro potvrzení napiš přesně `RESET`.", ephemeral=True)
+        await interaction.response.send_message("❌ Type exactly `RESET`.", ephemeral=True)
         return
 
     cursor.execute("DELETE FROM attendance_votes")
@@ -524,12 +861,101 @@ async def attendance_reset(interaction: discord.Interaction, confirm: str):
     conn.commit()
 
     event = get_event()
+
     if event:
         race_name, race_ts, reserve_ts, channel_id, message_id, is_open, reserves_assigned = event
         set_event(race_name, race_ts, reserve_ts, channel_id, message_id, is_open, 0)
         await update_attendance_message()
 
-    await interaction.response.send_message("✅ Attendance odpovědi byly resetovány.", ephemeral=True)
+    await interaction.response.send_message("✅ Attendance votes have been reset.", ephemeral=True)
+
+
+@bot.tree.command(name="reserves", description="Admin: show active reserves")
+async def reserves(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    rows = get_status_users("reserve")
+
+    embed = discord.Embed(
+        title="🟡 ACTIVE RESERVES",
+        color=discord.Color.orange()
+    )
+
+    embed.description = format_user_list(rows)
+    embed.set_footer(text="CSL Attendance System • Reserve List")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="reserve_assign", description="Admin: manually assign reserve to team seat")
+@app_commands.describe(
+    reserve="Reserve driver",
+    team="Team name",
+    seat="IRL driver / seat name"
+)
+async def reserve_assign(interaction: discord.Interaction, reserve: discord.Member, team: str, seat: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    vote = get_vote(reserve.id)
+
+    if vote != "reserve":
+        await interaction.response.send_message(
+            "❌ This driver is not marked as Reserve.",
+            ephemeral=True
+        )
+        return
+
+    seat_data = find_seat(team, seat)
+
+    if not seat_data:
+        await interaction.response.send_message("❌ Team or seat not found.", ephemeral=True)
+        return
+
+    event = get_event()
+    race_name = event[0] if event else "Current Race"
+    race_ts = event[1] if event else 0
+
+    replacing_id = seat_data["driver_id"]
+    replacing_name = seat_data["driver_name"]
+
+    set_seat_driver(seat_data["team_name"], seat_data["slot"], reserve)
+
+    cursor.execute("""
+        INSERT INTO reserve_assignments
+        (reserve_id, reserve_name, team_name, seat_name, replacing_id, replacing_name, created_ts)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        reserve.id,
+        reserve.display_name,
+        seat_data["team_name"],
+        seat_data["seat_name"],
+        replacing_id,
+        replacing_name,
+        now_ts()
+    ))
+    conn.commit()
+
+    embed = discord.Embed(
+        title="🟡 RESERVE ASSIGNMENT",
+        description=f"{reserve.mention} has been assigned to **{seat_data['team_name']}** as **{seat_data['seat_name']}**.",
+        color=discord.Color.orange()
+    )
+
+    if replacing_id:
+        embed.add_field(name="Replacing", value=f"<@{replacing_id}>", inline=True)
+
+    embed.add_field(name="Race", value=f"**{race_name}**", inline=True)
+
+    if race_ts:
+        embed.add_field(name="Race Start", value=format_dt(race_ts), inline=True)
+
+    embed.set_footer(text="CSL Attendance System • FIA Reserve Manager")
+
+    await interaction.response.send_message(embed=embed)
 
 
 if not TOKEN:
