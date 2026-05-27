@@ -324,24 +324,43 @@ def set_seat_driver(team_name: str, slot: int, member: discord.Member | None):
     conn.commit()
 
 
-def missing_or_empty_slots():
+def get_team_slots_for_reserves():
     """
-    Slots that can be filled by reserves:
-    - empty seat
-    - driver voted no
-    - driver voted maybe
-    - driver did not vote
+    Returns teams with slots usable by reserves.
+
+    Priority logic:
+    1) completely free/problem team with 2 usable slots
+    2) teams with 1 usable slot
+    3) maybe/no response are lower priority than EMPTY / Not Racing
+
+    A seat is usable when:
+    - EMPTY
+    - assigned driver voted Not Racing
+    - assigned driver voted Maybe
+    - assigned driver did not respond
+
+    A seat is NOT usable when assigned driver voted Racing.
     """
     cursor.execute("""
         SELECT team_name, seat1_name, seat1_driver_id, seat1_driver_name, seat2_name, seat2_driver_id, seat2_driver_name
         FROM teams
         ORDER BY team_name ASC
     """)
-    teams = cursor.fetchall()
+    rows = cursor.fetchall()
 
-    missing = []
+    teams = []
 
-    for team_name, s1, d1_id, d1_name, s2, d2_id, d2_name in teams:
+    reason_priority = {
+        "empty": 0,
+        "no": 1,
+        "maybe": 2,
+        "no_response": 3
+    }
+
+    for team_name, s1, d1_id, d1_name, s2, d2_id, d2_name in rows:
+        usable_slots = []
+        racing_count = 0
+
         for slot, seat_name, driver_id, driver_name in [
             (1, s1, d1_id, d1_name),
             (2, s2, d2_id, d2_name)
@@ -350,121 +369,78 @@ def missing_or_empty_slots():
                 continue
 
             if not driver_id:
-                missing.append((team_name, slot, seat_name, None, None, "empty"))
+                usable_slots.append({
+                    "team_name": team_name,
+                    "slot": slot,
+                    "seat_name": seat_name,
+                    "driver_id": None,
+                    "driver_name": None,
+                    "reason": "empty",
+                    "reason_priority": reason_priority["empty"]
+                })
                 continue
 
             vote = get_vote(driver_id)
-            if vote in [None, "no", "maybe"]:
-                missing.append((team_name, slot, seat_name, driver_id, driver_name, vote or "no_response"))
 
-    return missing
-
-
-
-
-def get_team_choices(current: str = ""):
-    current = (current or "").lower().strip()
-
-    cursor.execute("""
-        SELECT team_name
-        FROM teams
-        ORDER BY team_name ASC
-    """)
-    rows = [row[0] for row in cursor.fetchall()]
-
-    # Fallback: if database has no teams yet, still show default 2011 teams.
-    if not rows:
-        rows = [team for team, seat1, seat2 in DEFAULT_TEAMS]
-
-    choices = []
-    for team_name in rows:
-        if current in team_name.lower():
-            choices.append(app_commands.Choice(name=team_name[:100], value=team_name[:100]))
-
-    return choices[:25]
-
-
-def get_all_seat_choices(current: str = ""):
-    current = (current or "").lower().strip()
-
-    cursor.execute("""
-        SELECT team_name, seat1_name, seat1_driver_id, seat2_name, seat2_driver_id
-        FROM teams
-        ORDER BY team_name ASC
-    """)
-    rows = cursor.fetchall()
-
-    choices = []
-
-    if not rows:
-        for team_name, seat1, seat2 in DEFAULT_TEAMS:
-            for seat_name in [seat1, seat2]:
-                label = f"{team_name} — {seat_name}"
-                if current in seat_name.lower() or current in team_name.lower():
-                    choices.append(app_commands.Choice(name=label[:100], value=seat_name[:100]))
-        return choices[:25]
-
-    for team_name, seat1_name, seat1_driver_id, seat2_name, seat2_driver_id in rows:
-        for seat_name, driver_id in [(seat1_name, seat1_driver_id), (seat2_name, seat2_driver_id)]:
-            if not seat_name:
+            if vote == "yes":
+                racing_count += 1
                 continue
 
-            status = "occupied" if driver_id else "EMPTY"
-            label = f"{team_name} — {seat_name} — {status}"
+            reason = vote if vote in ["no", "maybe"] else "no_response"
 
-            if current in seat_name.lower() or current in team_name.lower():
-                choices.append(app_commands.Choice(name=label[:100], value=seat_name[:100]))
+            usable_slots.append({
+                "team_name": team_name,
+                "slot": slot,
+                "seat_name": seat_name,
+                "driver_id": driver_id,
+                "driver_name": driver_name,
+                "reason": reason,
+                "reason_priority": reason_priority.get(reason, 3)
+            })
 
-    return choices[:25]
+        if usable_slots:
+            usable_slots.sort(key=lambda x: x["reason_priority"])
 
+            # Higher priority number = earlier in sorting below.
+            # 2 usable slots means bot will try to keep reserves together in one team.
+            complete_free_score = 1 if len(usable_slots) >= 2 and racing_count == 0 else 0
 
-def get_seat_choices_for_team(team: str | None, current: str = ""):
-    current = (current or "").lower().strip()
+            teams.append({
+                "team_name": team_name,
+                "usable_slots": usable_slots,
+                "complete_free_score": complete_free_score,
+                "usable_count": len(usable_slots),
+                "best_reason_priority": min(slot["reason_priority"] for slot in usable_slots)
+            })
 
-    # If team is not selected yet, show all seats as fallback.
-    if not team:
-        return get_all_seat_choices(current)
+    teams.sort(
+        key=lambda t: (
+            -t["complete_free_score"],   # full/free teams first
+            -t["usable_count"],          # then teams with more available slots
+            t["best_reason_priority"],   # then EMPTY / Not Racing before Maybe / no response
+            t["team_name"].lower()
+        )
+    )
 
-    row = find_team(str(team))
-
-    # Fallback to default 2011 list if team is not saved in DB yet.
-    if not row:
-        for default_team, seat1, seat2 in DEFAULT_TEAMS:
-            if default_team.lower() == str(team).lower():
-                choices = []
-                for seat_name in [seat1, seat2]:
-                    if current in seat_name.lower():
-                        choices.append(app_commands.Choice(name=f"{seat_name} — EMPTY"[:100], value=seat_name[:100]))
-                return choices[:25]
-        return get_all_seat_choices(current)
-
-    team_name, seat1_name, seat1_driver_id, seat1_driver_name, seat2_name, seat2_driver_id, seat2_driver_name = row
-    seats = []
-
-    for seat_name, driver_id in [(seat1_name, seat1_driver_id), (seat2_name, seat2_driver_id)]:
-        if not seat_name:
-            continue
-
-        label = f"{seat_name} — occupied" if driver_id else f"{seat_name} — EMPTY"
-
-        if current in seat_name.lower():
-            seats.append(app_commands.Choice(name=label[:100], value=seat_name[:100]))
-
-    return seats[:25]
+    return teams
 
 
-async def team_autocomplete(interaction: discord.Interaction, current: str):
-    return get_team_choices(current)
-
-
-async def seat_autocomplete(interaction: discord.Interaction, current: str):
-    selected_team = getattr(interaction.namespace, "team", None)
-
-    # Sometimes Discord can pass Choice-like objects.
-    if hasattr(selected_team, "value"):
-        selected_team = selected_team.value
-
-    return get_seat_choices_for_team(selected_team, current)
+def missing_or_empty_slots():
+    """
+    Backwards-compatible flat list used by older code.
+    """
+    flat = []
+    for team in get_team_slots_for_reserves():
+        for slot in team["usable_slots"]:
+            flat.append((
+                slot["team_name"],
+                slot["slot"],
+                slot["seat_name"],
+                slot["driver_id"],
+                slot["driver_name"],
+                slot["reason"]
+            ))
+    return flat
 
 
 def create_attendance_embed():
@@ -600,16 +576,16 @@ async def update_attendance_message():
         print(f"Attendance update error: {e}")
 
 
-async def auto_assign_reserves(channel: discord.TextChannel | discord.Thread):
+async def auto_assign_reserves(channel: discord.TextChannel | discord.Thread, manual=False):
     event = get_event()
 
     if not event:
-        return
+        return "❌ No attendance check is active."
 
     race_name, race_ts, reserve_ts, channel_id, message_id, is_open, reserves_assigned = event
 
-    if reserves_assigned == 1:
-        return
+    if reserves_assigned == 1 and not manual:
+        return "ℹ️ Reserve assignments have already been created."
 
     cursor.execute("""
         SELECT user_id, user_name
@@ -619,65 +595,98 @@ async def auto_assign_reserves(channel: discord.TextChannel | discord.Thread):
     """)
     reserves = cursor.fetchall()
 
-    slots = missing_or_empty_slots()
+    if not reserves:
+        return "ℹ️ No reserve drivers are available."
 
-    if not reserves or not slots:
-        cursor.execute("UPDATE attendance_events SET reserves_assigned = 1 WHERE id = 1")
-        conn.commit()
-        return
+    team_slots = get_team_slots_for_reserves()
+
+    if not team_slots:
+        return "✅ No reserve assignment needed. All active seats are covered."
 
     assignments = []
     used_reserves = set()
+    reserve_index = 0
 
-    for team_name, slot, seat_name, replacing_id, replacing_name, reason in slots:
-        chosen = None
+    # Smart assignment:
+    # - process full/free teams first
+    # - when a team has 2 usable seats and at least 2 reserves, fill both seats together
+    for team in team_slots:
+        for slot_data in team["usable_slots"]:
+            while reserve_index < len(reserves) and reserves[reserve_index][0] in used_reserves:
+                reserve_index += 1
 
-        for reserve_id, reserve_name in reserves:
-            if reserve_id not in used_reserves:
-                chosen = (reserve_id, reserve_name)
+            if reserve_index >= len(reserves):
                 break
 
-        if not chosen:
+            reserve_id, reserve_name = reserves[reserve_index]
+            reserve_index += 1
+            used_reserves.add(reserve_id)
+
+            cursor.execute("""
+                INSERT INTO reserve_assignments
+                (reserve_id, reserve_name, team_name, seat_name, replacing_id, replacing_name, created_ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                reserve_id,
+                reserve_name,
+                slot_data["team_name"],
+                slot_data["seat_name"],
+                slot_data["driver_id"],
+                slot_data["driver_name"],
+                now_ts()
+            ))
+            conn.commit()
+
+            assignments.append({
+                "reserve_id": reserve_id,
+                "reserve_name": reserve_name,
+                "team_name": slot_data["team_name"],
+                "seat_name": slot_data["seat_name"],
+                "replacing_id": slot_data["driver_id"],
+                "reason": slot_data["reason"]
+            })
+
+        if reserve_index >= len(reserves):
             break
 
-        reserve_id, reserve_name = chosen
-        used_reserves.add(reserve_id)
-
-        replacing_text = replacing_name if replacing_id else None
-
-        cursor.execute("""
-            INSERT INTO reserve_assignments
-            (reserve_id, reserve_name, team_name, seat_name, replacing_id, replacing_name, created_ts)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (reserve_id, reserve_name, team_name, seat_name, replacing_id, replacing_text, now_ts()))
-        conn.commit()
-
-        assignments.append((reserve_id, team_name, seat_name, replacing_id))
+    if not assignments:
+        return "ℹ️ No reserve assignments were created."
 
     cursor.execute("UPDATE attendance_events SET reserves_assigned = 1 WHERE id = 1")
     conn.commit()
 
-    if not assignments:
-        return
-
     embed = discord.Embed(
-        title="🟡 CSL AUTO RESERVE ASSIGNMENTS",
-        description=f"Automatic reserve assignment for **{race_name}**.",
+        title="🟡 AUTO RESERVE ASSIGNMENTS",
+        description=f"Smart reserve assignment for **{race_name}**.",
         color=discord.Color.orange()
     )
 
+    grouped = {}
+    for item in assignments:
+        grouped.setdefault(item["team_name"], []).append(item)
+
     text = ""
-    for reserve_id, team_name, seat_name, replacing_id in assignments:
-        text += f"🟡 <@{reserve_id}> → **{team_name}** as **{seat_name}**"
-        if replacing_id:
-            text += f" replacing <@{replacing_id}>"
+    for team_name, items in grouped.items():
+        text += f"**{team_name}**\n"
+        for item in items:
+            text += f"• <@{item['reserve_id']}> → **{item['seat_name']}**"
+            if item["replacing_id"]:
+                text += f" replacing <@{item['replacing_id']}>"
+            text += "\n"
         text += "\n"
 
-    embed.add_field(name="📋 Assignments", value=text[:1024], inline=False)
-    embed.add_field(name="📅 Race Start", value=format_dt(race_ts), inline=True)
-    embed.set_footer(text="CSL Attendance System • Auto Reserve Manager")
+    embed.add_field(name="Assignments", value=text[:1024], inline=False)
+    embed.add_field(name="Race Start", value=format_dt(race_ts), inline=True)
+
+    remaining_reserves = len(reserves) - len(assignments)
+    if remaining_reserves > 0:
+        embed.add_field(name="Unused Reserves", value=f"**{remaining_reserves}** reserve(s) were not needed.", inline=True)
+
+    embed.set_footer(text="CSL Attendance System • Smart Auto Reserve Manager")
 
     await channel.send(embed=embed)
+    return f"✅ Auto reserve assignments created: **{len(assignments)}**"
+
 
 
 @tasks.loop(seconds=60)
@@ -1296,6 +1305,19 @@ async def multi_seat4_autocomplete(interaction: discord.Interaction, current: st
 @multi_reserve_assign.autocomplete("seat5")
 async def multi_seat5_autocomplete(interaction: discord.Interaction, current: str):
     return await multi_seat_autocomplete_for(interaction, current, "team5")
+
+
+@bot.tree.command(name="auto_reserve_assign", description="Admin: run smart automatic reserve assignment now")
+async def auto_reserve_assign(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    result = await auto_assign_reserves(interaction.channel, manual=True)
+
+    await interaction.followup.send(result, ephemeral=True)
 
 
 if not TOKEN:
