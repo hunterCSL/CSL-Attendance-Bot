@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS attendance_events (
     race_name TEXT,
     race_ts INTEGER,
     reserve_ts INTEGER,
+    attendance_close_ts INTEGER DEFAULT 0,
     channel_id INTEGER DEFAULT 0,
     message_id INTEGER DEFAULT 0,
     is_open INTEGER DEFAULT 1,
@@ -111,6 +112,12 @@ for column in [
 
 try:
     cursor.execute("ALTER TABLE reserve_assignments ADD COLUMN seat_name TEXT")
+    conn.commit()
+except sqlite3.OperationalError:
+    pass
+
+try:
+    cursor.execute("ALTER TABLE attendance_events ADD COLUMN attendance_close_ts INTEGER DEFAULT 0")
     conn.commit()
 except sqlite3.OperationalError:
     pass
@@ -170,27 +177,28 @@ def format_left(ts: int):
 
 def get_event():
     cursor.execute("""
-        SELECT race_name, race_ts, reserve_ts, channel_id, message_id, is_open, reserves_assigned
+        SELECT race_name, race_ts, reserve_ts, attendance_close_ts, channel_id, message_id, is_open, reserves_assigned
         FROM attendance_events
         WHERE id = 1
     """)
     return cursor.fetchone()
 
 
-def set_event(race_name, race_ts, reserve_ts, channel_id=0, message_id=0, is_open=1, reserves_assigned=0):
+def set_event(race_name, race_ts, reserve_ts, channel_id=0, message_id=0, is_open=1, reserves_assigned=0, attendance_close_ts=0):
     cursor.execute("""
         INSERT INTO attendance_events
-        (id, race_name, race_ts, reserve_ts, channel_id, message_id, is_open, reserves_assigned)
-        VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+        (id, race_name, race_ts, reserve_ts, attendance_close_ts, channel_id, message_id, is_open, reserves_assigned)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             race_name = excluded.race_name,
             race_ts = excluded.race_ts,
             reserve_ts = excluded.reserve_ts,
+            attendance_close_ts = excluded.attendance_close_ts,
             channel_id = excluded.channel_id,
             message_id = excluded.message_id,
             is_open = excluded.is_open,
             reserves_assigned = excluded.reserves_assigned
-    """, (race_name, race_ts, reserve_ts, channel_id, message_id, is_open, reserves_assigned))
+    """, (race_name, race_ts, reserve_ts, attendance_close_ts, channel_id, message_id, is_open, reserves_assigned))
     conn.commit()
 
 
@@ -294,6 +302,16 @@ def find_seat(team: str, seat: str):
     return None
 
 
+
+def is_user_already_in_team(user_id: int):
+    cursor.execute("""
+        SELECT team_name, seat1_name, seat2_name
+        FROM teams
+        WHERE seat1_driver_id = ? OR seat2_driver_id = ?
+    """, (user_id, user_id))
+    return cursor.fetchone()
+
+
 def set_seat_driver(team_name: str, slot: int, member: discord.Member | None):
     if slot == 1:
         if member:
@@ -326,20 +344,13 @@ def set_seat_driver(team_name: str, slot: int, member: discord.Member | None):
 
 def get_team_slots_for_reserves():
     """
-    Returns teams with slots usable by reserves.
+    Reserve priority:
+    1. completely free team = both seats EMPTY / unavailable
+    2. team with 1 free seat
+    3. team where someone did not respond
+    4. team where someone selected Maybe
 
-    Priority logic:
-    1) completely free/problem team with 2 usable slots
-    2) teams with 1 usable slot
-    3) maybe/no response are lower priority than EMPTY / Not Racing
-
-    A seat is usable when:
-    - EMPTY
-    - assigned driver voted Not Racing
-    - assigned driver voted Maybe
-    - assigned driver did not respond
-
-    A seat is NOT usable when assigned driver voted Racing.
+    Reserve assignments do NOT replace saved main team drivers.
     """
     cursor.execute("""
         SELECT team_name, seat1_name, seat1_driver_id, seat1_driver_name, seat2_name, seat2_driver_id, seat2_driver_name
@@ -352,9 +363,9 @@ def get_team_slots_for_reserves():
 
     reason_priority = {
         "empty": 0,
-        "no": 1,
-        "maybe": 2,
-        "no_response": 3
+        "no": 0,
+        "no_response": 2,
+        "maybe": 3
     }
 
     for team_name, s1, d1_id, d1_name, s2, d2_id, d2_name in rows:
@@ -386,7 +397,12 @@ def get_team_slots_for_reserves():
                 racing_count += 1
                 continue
 
-            reason = vote if vote in ["no", "maybe"] else "no_response"
+            if vote == "no":
+                reason = "no"
+            elif vote == "maybe":
+                reason = "maybe"
+            else:
+                reason = "no_response"
 
             usable_slots.append({
                 "team_name": team_name,
@@ -395,29 +411,32 @@ def get_team_slots_for_reserves():
                 "driver_id": driver_id,
                 "driver_name": driver_name,
                 "reason": reason,
-                "reason_priority": reason_priority.get(reason, 3)
+                "reason_priority": reason_priority[reason]
             })
 
         if usable_slots:
             usable_slots.sort(key=lambda x: x["reason_priority"])
-
-            # Higher priority number = earlier in sorting below.
-            # 2 usable slots means bot will try to keep reserves together in one team.
-            complete_free_score = 1 if len(usable_slots) >= 2 and racing_count == 0 else 0
+            full_team_score = 1 if len(usable_slots) >= 2 and racing_count == 0 else 0
+            free_slots_count = sum(1 for slot in usable_slots if slot["reason"] in ["empty", "no"])
+            empty_count = sum(1 for slot in usable_slots if slot["reason"] == "empty")
 
             teams.append({
                 "team_name": team_name,
                 "usable_slots": usable_slots,
-                "complete_free_score": complete_free_score,
+                "full_team_score": full_team_score,
+                "free_slots_count": free_slots_count,
+                "empty_count": empty_count,
                 "usable_count": len(usable_slots),
                 "best_reason_priority": min(slot["reason_priority"] for slot in usable_slots)
             })
 
     teams.sort(
         key=lambda t: (
-            -t["complete_free_score"],   # full/free teams first
-            -t["usable_count"],          # then teams with more available slots
-            t["best_reason_priority"],   # then EMPTY / Not Racing before Maybe / no response
+            -t["full_team_score"],
+            -t["free_slots_count"],
+            -t["empty_count"],
+            -t["usable_count"],
+            t["best_reason_priority"],
             t["team_name"].lower()
         )
     )
@@ -571,7 +590,7 @@ def create_attendance_embed():
             color=discord.Color.red()
         )
 
-    race_name, race_ts, reserve_ts, channel_id, message_id, is_open, reserves_assigned = event
+    race_name, race_ts, reserve_ts, attendance_close_ts, channel_id, message_id, is_open, reserves_assigned = event
     status = "🟢 OPEN" if is_open == 1 else "🔴 CLOSED"
 
     embed = discord.Embed(
@@ -581,6 +600,10 @@ def create_attendance_embed():
     )
 
     embed.add_field(name="📅 Race Start", value=f"{format_dt(race_ts)}\n**In {format_left(race_ts)}**", inline=True)
+
+    if attendance_close_ts:
+        embed.add_field(name="🔒 Vote Closes", value=f"{format_dt(attendance_close_ts)}\n**In {format_left(attendance_close_ts)}**", inline=True)
+
     embed.add_field(name="🟡 Reserve Check", value=f"{format_dt(reserve_ts)}\n**In {format_left(reserve_ts)}**", inline=True)
     embed.add_field(name="📊 Status", value=f"**{status}**", inline=True)
 
@@ -639,7 +662,7 @@ class AttendanceView(discord.ui.View):
             await interaction.response.send_message("❌ No attendance check is active.", ephemeral=True)
             return
 
-        race_name, race_ts, reserve_ts, channel_id, message_id, is_open, reserves_assigned = event
+        race_name, race_ts, reserve_ts, attendance_close_ts, channel_id, message_id, is_open, reserves_assigned = event
 
         if is_open != 1:
             await interaction.response.send_message("❌ Attendance check is closed.", ephemeral=True)
@@ -677,7 +700,7 @@ async def update_attendance_message():
     if not event:
         return
 
-    race_name, race_ts, reserve_ts, channel_id, message_id, is_open, reserves_assigned = event
+    race_name, race_ts, reserve_ts, attendance_close_ts, channel_id, message_id, is_open, reserves_assigned = event
 
     if not channel_id or not message_id:
         return
@@ -700,7 +723,7 @@ async def auto_assign_reserves(channel: discord.TextChannel | discord.Thread, ma
     if not event:
         return "❌ No attendance check is active."
 
-    race_name, race_ts, reserve_ts, channel_id, message_id, is_open, reserves_assigned = event
+    race_name, race_ts, reserve_ts, attendance_close_ts, channel_id, message_id, is_open, reserves_assigned = event
 
     if reserves_assigned == 1 and not manual:
         return "ℹ️ Reserve assignments have already been created."
@@ -711,10 +734,16 @@ async def auto_assign_reserves(channel: discord.TextChannel | discord.Thread, ma
         WHERE status = 'reserve'
         ORDER BY user_name ASC
     """)
-    reserves = cursor.fetchall()
+    raw_reserves = cursor.fetchall()
+
+    reserves = []
+    for reserve_id, reserve_name in raw_reserves:
+        if is_user_already_in_team(reserve_id):
+            continue
+        reserves.append((reserve_id, reserve_name))
 
     if not reserves:
-        return "ℹ️ No reserve drivers are available."
+        return "ℹ️ No available reserve drivers. Drivers already assigned to team seats are ignored."
 
     team_slots = get_team_slots_for_reserves()
 
@@ -725,9 +754,6 @@ async def auto_assign_reserves(channel: discord.TextChannel | discord.Thread, ma
     used_reserves = set()
     reserve_index = 0
 
-    # Smart assignment:
-    # - process full/free teams first
-    # - when a team has 2 usable seats and at least 2 reserves, fill both seats together
     for team in team_slots:
         for slot_data in team["usable_slots"]:
             while reserve_index < len(reserves) and reserves[reserve_index][0] in used_reserves:
@@ -785,16 +811,19 @@ async def auto_assign_reserves(channel: discord.TextChannel | discord.Thread, ma
 
     text = ""
     for team_name, items in grouped.items():
-        text += f"**{team_name}**\n"
+        text += f"**🏎️ {team_name}**\n"
         for item in items:
-            text += f"• <@{item['reserve_id']}> → **{item['seat_name']}**"
+            text += f"• **{item['reserve_name']}** → **{item['seat_name']}**"
             if item["replacing_id"]:
-                text += f" replacing <@{item['replacing_id']}>"
+                text += f" *(covering unavailable seat)*"
             text += "\n"
         text += "\n"
 
     embed.add_field(name="Assignments", value=text[:1024], inline=False)
     embed.add_field(name="Race Start", value=format_dt(race_ts), inline=True)
+
+    if attendance_close_ts:
+        embed.add_field(name="Voting Closed", value=format_dt(attendance_close_ts), inline=True)
 
     remaining_reserves = len(reserves) - len(assignments)
     if remaining_reserves > 0:
@@ -814,7 +843,11 @@ async def reserve_checker():
     if not event:
         return
 
-    race_name, race_ts, reserve_ts, channel_id, message_id, is_open, reserves_assigned = event
+    race_name, race_ts, reserve_ts, attendance_close_ts, channel_id, message_id, is_open, reserves_assigned = event
+
+    if is_open == 1 and attendance_close_ts != 0 and now_ts() >= attendance_close_ts:
+        set_event(race_name, race_ts, reserve_ts, channel_id, message_id, 0, reserves_assigned, attendance_close_ts)
+        await update_attendance_message()
 
     if reserves_assigned == 1:
         return
@@ -824,6 +857,7 @@ async def reserve_checker():
 
         if channel:
             await auto_assign_reserves(channel)
+
 
 
 @bot.event
@@ -859,6 +893,14 @@ async def team_edit(
 ):
     if not is_admin(interaction):
         await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    if seat1_driver and seat1_driver.bot:
+        await interaction.response.send_message("❌ Bots cannot be assigned to team seats.", ephemeral=True)
+        return
+
+    if seat2_driver and seat2_driver.bot:
+        await interaction.response.send_message("❌ Bots cannot be assigned to team seats.", ephemeral=True)
         return
 
     seat1_driver_id = seat1_driver.id if seat1_driver else None
@@ -935,6 +977,10 @@ async def team_add_2011_defaults(interaction: discord.Interaction, confirm: str)
 async def team_set_driver(interaction: discord.Interaction, team: str, seat: str, driver: discord.Member):
     if not is_admin(interaction):
         await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    if driver.bot:
+        await interaction.response.send_message("❌ Bots cannot be assigned to team seats.", ephemeral=True)
         return
 
     seat_data = find_seat(team, seat)
@@ -1021,16 +1067,22 @@ async def teams(interaction: discord.Interaction):
 @bot.tree.command(name="attendance_create", description="Admin: create attendance check")
 @app_commands.describe(
     race="Race name, e.g. Race 16 - Surfers Paradise 🇦🇺",
-    date="Date, e.g. 23.5.2026",
-    time_text="Race time, e.g. 20:00",
-    reserve_minutes_before="When reserve assignment happens, e.g. 60"
+    date="Race date, e.g. 30.05.2026",
+    time_text="Race start time, e.g. 20:00",
+    vote_close_date="Vote close date, e.g. 30.05.2026",
+    vote_close_time="Vote close time, e.g. 18:00",
+    reserve_date="Reserve assignment date, e.g. 30.05.2026",
+    reserve_time="Reserve assignment time, e.g. 19:00"
 )
 async def attendance_create(
     interaction: discord.Interaction,
     race: str,
     date: str,
     time_text: str,
-    reserve_minutes_before: int = 60
+    vote_close_date: str,
+    vote_close_time: str,
+    reserve_date: str,
+    reserve_time: str
 ):
     if not is_admin(interaction):
         await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
@@ -1038,22 +1090,30 @@ async def attendance_create(
 
     try:
         race_ts = parse_race_datetime(date, time_text)
+        attendance_close_ts = parse_race_datetime(vote_close_date, vote_close_time)
+        reserve_ts = parse_race_datetime(reserve_date, reserve_time)
     except Exception:
-        await interaction.response.send_message("❌ Invalid date or time format. Use `23.5.2026` and `20:00`.", ephemeral=True)
+        await interaction.response.send_message("❌ Invalid date or time format. Use date `30.05.2026` and time `18:00`.", ephemeral=True)
         return
 
-    reserve_ts = race_ts - reserve_minutes_before * 60
+    if attendance_close_ts > race_ts:
+        await interaction.response.send_message("❌ Vote close time cannot be after race start.", ephemeral=True)
+        return
+
+    if reserve_ts > race_ts:
+        await interaction.response.send_message("❌ Reserve assignment time cannot be after race start.", ephemeral=True)
+        return
 
     cursor.execute("DELETE FROM attendance_votes")
     cursor.execute("DELETE FROM reserve_assignments")
     conn.commit()
 
-    set_event(race, race_ts, reserve_ts, interaction.channel.id, 0, 1, 0)
+    set_event(race, race_ts, reserve_ts, interaction.channel.id, 0, 1, 0, attendance_close_ts)
 
     await interaction.response.send_message(embed=create_attendance_embed(), view=AttendanceView())
     msg = await interaction.original_response()
 
-    set_event(race, race_ts, reserve_ts, msg.channel.id, msg.id, 1, 0)
+    set_event(race, race_ts, reserve_ts, msg.channel.id, msg.id, 1, 0, attendance_close_ts)
 
 
 @bot.tree.command(name="attendance_status", description="Show attendance status")
@@ -1073,9 +1133,9 @@ async def attendance_close(interaction: discord.Interaction):
         await interaction.response.send_message("❌ No attendance check is active.", ephemeral=True)
         return
 
-    race_name, race_ts, reserve_ts, channel_id, message_id, is_open, reserves_assigned = event
+    race_name, race_ts, reserve_ts, attendance_close_ts, channel_id, message_id, is_open, reserves_assigned = event
 
-    set_event(race_name, race_ts, reserve_ts, channel_id, message_id, 0, reserves_assigned)
+    set_event(race_name, race_ts, reserve_ts, channel_id, message_id, 0, reserves_assigned, attendance_close_ts)
     await update_attendance_message()
 
     await interaction.response.send_message("🔒 Attendance check has been closed.", ephemeral=True)
@@ -1099,8 +1159,8 @@ async def attendance_reset(interaction: discord.Interaction, confirm: str):
     event = get_event()
 
     if event:
-        race_name, race_ts, reserve_ts, channel_id, message_id, is_open, reserves_assigned = event
-        set_event(race_name, race_ts, reserve_ts, channel_id, message_id, is_open, 0)
+        race_name, race_ts, reserve_ts, attendance_close_ts, channel_id, message_id, is_open, reserves_assigned = event
+        set_event(race_name, race_ts, reserve_ts, channel_id, message_id, is_open, 0, attendance_close_ts)
         await update_attendance_message()
 
     await interaction.response.send_message("✅ Attendance votes have been reset.", ephemeral=True)
@@ -1136,6 +1196,18 @@ async def reserve_assign(interaction: discord.Interaction, reserve: discord.Memb
         await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
         return
 
+    if reserve.bot:
+        await interaction.response.send_message("❌ Bots cannot be assigned as reserves.", ephemeral=True)
+        return
+
+    existing_team = is_user_already_in_team(reserve.id)
+    if existing_team:
+        await interaction.response.send_message(
+            f"❌ {reserve.mention} is already assigned to a team seat and cannot be used as a reserve.",
+            ephemeral=True
+        )
+        return
+
     vote = get_vote(reserve.id)
 
     if vote != "reserve":
@@ -1158,8 +1230,7 @@ async def reserve_assign(interaction: discord.Interaction, reserve: discord.Memb
     replacing_id = seat_data["driver_id"]
     replacing_name = seat_data["driver_name"]
 
-    set_seat_driver(seat_data["team_name"], seat_data["slot"], reserve)
-
+    # Reserve assignment does not replace the saved main team driver.
     cursor.execute("""
         INSERT INTO reserve_assignments
         (reserve_id, reserve_name, team_name, seat_name, replacing_id, replacing_name, created_ts)
@@ -1309,6 +1380,14 @@ async def multi_reserve_assign(
     errors = []
 
     for reserve, team, seat in cleaned:
+        if reserve.bot:
+            errors.append(f"❌ {reserve.mention} is a bot and cannot be assigned as reserve.")
+            continue
+
+        if is_user_already_in_team(reserve.id):
+            errors.append(f"❌ {reserve.mention} is already assigned to a team seat.")
+            continue
+
         vote = get_vote(reserve.id)
 
         if vote != "reserve":
@@ -1324,8 +1403,7 @@ async def multi_reserve_assign(
         replacing_id = seat_data["driver_id"]
         replacing_name = seat_data["driver_name"]
 
-        set_seat_driver(seat_data["team_name"], seat_data["slot"], reserve)
-
+        # Reserve assignment does not replace the saved main team driver.
         cursor.execute("""
             INSERT INTO reserve_assignments
             (reserve_id, reserve_name, team_name, seat_name, replacing_id, replacing_name, created_ts)
