@@ -931,7 +931,8 @@ def create_dotd_embed():
     )
 
     if close_ts:
-        embed.add_field(name="⏳ Voting Closes", value=f"{format_dt(close_ts)}\n**In {format_left(close_ts)}**", inline=True)
+        close_text = f"{format_dt(close_ts)}\n**In {format_left(close_ts)}**" if is_open else f"{format_dt(close_ts)}\n**Closed**"
+        embed.add_field(name="⏳ Voting Closes", value=close_text, inline=True)
 
     status = "🟢 OPEN" if is_open else "🔴 CLOSED"
     embed.add_field(name="📊 Status", value=f"**{status}**", inline=True)
@@ -1020,7 +1021,13 @@ class DOTDSelect(discord.ui.Select):
         conn.commit()
 
         await interaction.response.send_message(f"✅ Your DOTD vote has been set to **{candidate_name}**.", ephemeral=True)
-        await update_dotd_message()
+
+        # Update the DOTD voting message immediately after every vote.
+        try:
+            await interaction.message.edit(embed=create_dotd_embed(), view=DOTDView())
+        except Exception as e:
+            print(f"DOTD direct message update error: {e}")
+            await update_dotd_message()
 
 
 class DOTDView(discord.ui.View):
@@ -1350,6 +1357,24 @@ async def reserve_checker():
             await auto_assign_reserves(channel)
 
 
+@tasks.loop(seconds=60)
+async def dotd_checker():
+    settings = get_dotd_settings()
+
+    if not settings:
+        return
+
+    race_name, channel_id, message_id, is_open, close_ts = settings
+
+    # Update countdown every 60s while voting message exists.
+    if message_id:
+        if is_open == 1 and close_ts != 0 and now_ts() >= close_ts:
+            set_dotd_settings(race_name, channel_id, message_id, 0, close_ts)
+
+        await update_dotd_message()
+
+
+
 
 @bot.event
 async def on_ready():
@@ -1364,6 +1389,9 @@ async def on_ready():
 
     if not reserve_checker.is_running():
         reserve_checker.start()
+
+    if not dotd_checker.is_running():
+        dotd_checker.start()
 
 
 # -------------------------
@@ -2156,6 +2184,10 @@ async def dotd_create(interaction: discord.Interaction, close_date: str, close_t
         close_ts = parse_race_datetime(close_date, close_time)
     except Exception:
         await interaction.response.send_message("❌ Invalid date/time format. Use `30.05.2026` and `22:00`.", ephemeral=True)
+        return
+
+    if close_ts <= now_ts():
+        await interaction.response.send_message("❌ DOTD close time must be in the future.", ephemeral=True)
         return
 
     race_name = get_race_name()
