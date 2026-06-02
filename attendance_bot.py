@@ -1919,7 +1919,8 @@ async def race_results_set(interaction: discord.Interaction, data: str):
 
 @bot.tree.command(name="race_results_show", description="Show official race results")
 async def race_results_show(interaction: discord.Interaction):
-    await interaction.response.send_message(embed=create_results_embed())
+    await interaction.response.defer()
+    await interaction.followup.send(embed=create_results_embed())
 
 
 @bot.tree.command(name="race_results_clear", description="Admin: clear race results")
@@ -1938,6 +1939,70 @@ async def race_results_clear(interaction: discord.Interaction, confirm: str):
     conn.commit()
 
     await interaction.response.send_message("🗑️ Race results and DOTD votes have been cleared.", ephemeral=True)
+
+
+
+@bot.tree.command(name="race_result_add", description="Admin: add one driver to race results")
+@app_commands.describe(
+    driver="Driver who raced",
+    result="Finish position number or DNF/DNS/DSQ"
+)
+async def race_result_add(interaction: discord.Interaction, driver: discord.Member, result: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    result_clean = result.strip().upper().replace("P", "")
+
+    if result_clean in ["DNF", "DNS", "DSQ"]:
+        position = 999
+        status = result_clean
+    else:
+        try:
+            position = int(result_clean)
+            if position <= 0:
+                raise ValueError
+            status = "FINISHED"
+        except ValueError:
+            await interaction.response.send_message("❌ Result must be a position number like `1` or status `DNF`, `DNS`, `DSQ`.", ephemeral=True)
+            return
+
+    cursor.execute("DELETE FROM race_results WHERE user_id = ?", (driver.id,))
+    cursor.execute("""
+        INSERT INTO race_results (position, user_id, user_name, status)
+        VALUES (?, ?, ?, ?)
+    """, (position, driver.id, driver.display_name, status))
+    conn.commit()
+
+    await interaction.response.send_message(
+        f"✅ Added result: **{driver.display_name}** → **{status if status != 'FINISHED' else 'P' + str(position)}**",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="race_result_remove", description="Admin: remove one driver from race results")
+@app_commands.describe(driver="Driver to remove from race results")
+async def race_result_remove(interaction: discord.Interaction, driver: discord.Member):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    cursor.execute("DELETE FROM race_results WHERE user_id = ?", (driver.id,))
+    conn.commit()
+
+    await interaction.response.send_message(f"🗑️ Removed **{driver.display_name}** from race results.", ephemeral=True)
+
+
+@bot.tree.command(name="race_results_post", description="Admin: post official race results publicly")
+async def race_results_post(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    await interaction.channel.send(embed=create_results_embed())
+    await interaction.followup.send("✅ Race results posted.", ephemeral=True)
+
 
 
 @bot.tree.command(name="dotd_create", description="Admin: create Driver of the Day voting from race results")
