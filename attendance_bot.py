@@ -697,6 +697,67 @@ def result_icon(position: int, status: str):
     return f"**P{position}**"
 
 
+def create_results_embed_fast():
+    race_name = get_race_name()
+
+    cursor.execute("""
+        SELECT position, user_id, user_name, status
+        FROM race_results
+        ORDER BY
+            CASE WHEN status = 'FINISHED' THEN 0 ELSE 1 END ASC,
+            position ASC,
+            user_name ASC
+    """)
+    rows = cursor.fetchall()
+
+    embed = discord.Embed(
+        title=f"🏁 OFFICIAL RACE RESULTS — {race_name}",
+        color=discord.Color.blurple()
+    )
+
+    if not rows:
+        embed.description = "No race results have been saved yet."
+        return embed
+
+    finished_lines = []
+    other_lines = []
+
+    for position, user_id, user_name, status in rows:
+        name = user_name or f"User {user_id}"
+
+        if status == "FINISHED":
+            if position == 1:
+                icon = "🥇"
+            elif position == 2:
+                icon = "🥈"
+            elif position == 3:
+                icon = "🥉"
+            else:
+                icon = f"P{position}"
+
+            finished_lines.append(f"{icon} **{name}**")
+        else:
+            icon = "❌" if status == "DNF" else "🚫" if status == "DNS" else "⚫"
+            other_lines.append(f"{icon} **{status}** — **{name}**")
+
+    if finished_lines:
+        embed.add_field(
+            name="Classified Results",
+            value="\n".join(finished_lines)[:1024],
+            inline=False
+        )
+
+    if other_lines:
+        embed.add_field(
+            name="DNF / DNS / DSQ",
+            value="\n".join(other_lines)[:1024],
+            inline=False
+        )
+
+    embed.set_footer(text="CSL Attendance System • Race Results")
+    return embed
+
+
 def create_results_embed():
     race_name = get_race_name()
 
@@ -1914,13 +1975,12 @@ async def race_results_set(interaction: discord.Interaction, data: str):
     conn.commit()
 
     await interaction.followup.send(f"✅ Race results saved. Drivers saved: **{created}**", ephemeral=True)
-    await interaction.channel.send(embed=create_results_embed())
+    await interaction.channel.send(embed=create_results_embed_fast())
 
 
 @bot.tree.command(name="race_results_show", description="Show official race results")
 async def race_results_show(interaction: discord.Interaction):
-    await interaction.response.defer()
-    await interaction.followup.send(embed=create_results_embed())
+    await interaction.response.send_message(embed=create_results_embed_fast())
 
 
 @bot.tree.command(name="race_results_clear", description="Admin: clear race results")
@@ -2000,7 +2060,7 @@ async def race_results_post(interaction: discord.Interaction):
         return
 
     await interaction.response.defer(ephemeral=True)
-    await interaction.channel.send(embed=create_results_embed())
+    await interaction.channel.send(embed=create_results_embed_fast())
     await interaction.followup.send("✅ Race results posted.", ephemeral=True)
 
 
