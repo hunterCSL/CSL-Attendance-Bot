@@ -93,6 +93,36 @@ CREATE TABLE IF NOT EXISTS reserve_assignments (
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS race_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    position INTEGER,
+    user_id INTEGER,
+    user_name TEXT,
+    status TEXT DEFAULT 'FINISHED'
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS dotd_votes (
+    user_id INTEGER PRIMARY KEY,
+    user_name TEXT,
+    candidate_id INTEGER,
+    candidate_name TEXT
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS dotd_settings (
+    id INTEGER PRIMARY KEY,
+    race_name TEXT,
+    channel_id INTEGER DEFAULT 0,
+    message_id INTEGER DEFAULT 0,
+    is_open INTEGER DEFAULT 0,
+    close_ts INTEGER DEFAULT 0
+)
+""")
+
 conn.commit()
 
 # Migration from older version
@@ -580,6 +610,334 @@ async def seat_autocomplete(interaction: discord.Interaction, current: str):
         return []
 
 
+
+def parse_results_data(data: str):
+    """
+    Format:
+    1 @Driver
+    2 @Driver
+    DNF @Driver
+    DNS @Driver
+    DSQ @Driver
+    """
+    rows = []
+
+    for raw_line in data.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+
+        first = parts[0].upper().replace(".", "").replace(":", "")
+        mention = None
+
+        for part in parts[1:]:
+            if part.startswith("<@") and part.endswith(">"):
+                mention = part
+                break
+
+        if not mention:
+            continue
+
+        try:
+            user_id = int(mention.replace("<@", "").replace("!", "").replace(">", ""))
+        except ValueError:
+            continue
+
+        if first in ["DNF", "DNS", "DSQ"]:
+            rows.append({"position": 999, "user_id": user_id, "status": first})
+        else:
+            first = first.replace("P", "")
+            try:
+                rows.append({"position": int(first), "user_id": user_id, "status": "FINISHED"})
+            except ValueError:
+                continue
+
+    return rows
+
+
+async def fetch_display_name(guild: discord.Guild, user_id: int):
+    member = guild.get_member(user_id) if guild else None
+    if member:
+        return member.display_name
+
+    try:
+        user = await bot.fetch_user(user_id)
+        return user.display_name
+    except Exception:
+        return f"User {user_id}"
+
+
+def get_race_name():
+    event = get_event()
+    if event:
+        return event[0]
+    return "Current Race"
+
+
+def result_icon(position: int, status: str):
+    status = str(status).upper()
+
+    if status == "DNF":
+        return "❌"
+    if status == "DNS":
+        return "🚫"
+    if status == "DSQ":
+        return "⚫"
+    if position == 1:
+        return "🥇"
+    if position == 2:
+        return "🥈"
+    if position == 3:
+        return "🥉"
+
+    return f"**P{position}**"
+
+
+def create_results_embed():
+    race_name = get_race_name()
+
+    cursor.execute("""
+        SELECT position, user_id, user_name, status
+        FROM race_results
+        ORDER BY
+            CASE WHEN status = 'FINISHED' THEN 0 ELSE 1 END ASC,
+            position ASC,
+            user_name ASC
+    """)
+    rows = cursor.fetchall()
+
+    embed = discord.Embed(
+        title=f"🏁 OFFICIAL RACE RESULTS — {race_name}",
+        color=discord.Color.blurple()
+    )
+
+    if not rows:
+        embed.description = "No race results have been saved yet."
+        return embed
+
+    finished_text = ""
+    dnf_text = ""
+
+    for position, user_id, user_name, status in rows:
+        if status == "FINISHED":
+            finished_text += f"{result_icon(position, status)} {format_member_display(user_id, user_name)}\n"
+        else:
+            dnf_text += f"{result_icon(position, status)} **{status}** — {format_member_display(user_id, user_name)}\n"
+
+    if finished_text:
+        embed.add_field(name="🏆 Classified Results", value=finished_text[:1024], inline=False)
+
+    if dnf_text:
+        embed.add_field(name="❌ DNF / DNS / DSQ", value=dnf_text[:1024], inline=False)
+
+    embed.set_footer(text="CSL Attendance System • Race Results")
+    return embed
+
+
+def get_dotd_settings():
+    cursor.execute("""
+        SELECT race_name, channel_id, message_id, is_open, close_ts
+        FROM dotd_settings
+        WHERE id = 1
+    """)
+    return cursor.fetchone()
+
+
+def set_dotd_settings(race_name, channel_id=0, message_id=0, is_open=0, close_ts=0):
+    cursor.execute("""
+        INSERT INTO dotd_settings (id, race_name, channel_id, message_id, is_open, close_ts)
+        VALUES (1, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            race_name = excluded.race_name,
+            channel_id = excluded.channel_id,
+            message_id = excluded.message_id,
+            is_open = excluded.is_open,
+            close_ts = excluded.close_ts
+    """, (race_name, channel_id, message_id, is_open, close_ts))
+    conn.commit()
+
+
+def get_dotd_candidates():
+    cursor.execute("""
+        SELECT user_id, user_name, status, position
+        FROM race_results
+        ORDER BY
+            CASE WHEN status = 'FINISHED' THEN 0 ELSE 1 END ASC,
+            position ASC,
+            user_name ASC
+    """)
+    return cursor.fetchall()
+
+
+def create_dotd_results_text():
+    cursor.execute("""
+        SELECT candidate_id, candidate_name, COUNT(*) as votes
+        FROM dotd_votes
+        GROUP BY candidate_id, candidate_name
+        ORDER BY votes DESC, candidate_name ASC
+    """)
+    rows = cursor.fetchall()
+
+    if not rows:
+        return "No DOTD votes yet."
+
+    total_votes = sum(row[2] for row in rows)
+    text = ""
+
+    for index, (candidate_id, candidate_name, votes) in enumerate(rows, start=1):
+        percent = round((votes / total_votes) * 100, 1) if total_votes > 0 else 0
+        medal = "🥇" if index == 1 else "🥈" if index == 2 else "🥉" if index == 3 else f"**{index}.**"
+        text += f"{medal} **{candidate_name}** — **{votes}** vote(s) ({percent}%)\n"
+
+    return text[:1024]
+
+
+def create_dotd_embed():
+    settings = get_dotd_settings()
+    race_name = settings[0] if settings else get_race_name()
+    close_ts = settings[4] if settings else 0
+    is_open = settings[3] if settings else 0
+
+    candidates = get_dotd_candidates()
+
+    embed = discord.Embed(
+        title=f"🏆 DRIVER OF THE DAY — {race_name}",
+        description="Vote for your Driver of the Day using the select menu below.",
+        color=discord.Color.gold() if is_open else discord.Color.dark_gold()
+    )
+
+    if close_ts:
+        embed.add_field(name="⏳ Voting Closes", value=f"{format_dt(close_ts)}\n**In {format_left(close_ts)}**", inline=True)
+
+    status = "🟢 OPEN" if is_open else "🔴 CLOSED"
+    embed.add_field(name="📊 Status", value=f"**{status}**", inline=True)
+
+    if not candidates:
+        embed.add_field(name="Candidates", value="No candidates. Save race results first.", inline=False)
+    else:
+        text = ""
+        for user_id, user_name, status, position in candidates:
+            status_text = status if status != "FINISHED" else f"P{position}"
+            text += f"• **{user_name}** — `{status_text}`\n"
+        embed.add_field(name="Candidates", value=text[:1024], inline=False)
+
+    embed.add_field(name="Current Results", value=create_dotd_results_text(), inline=False)
+    embed.set_footer(text="CSL Attendance System • DOTD Voting")
+    return embed
+
+
+class DOTDSelect(discord.ui.Select):
+    def __init__(self):
+        candidates = get_dotd_candidates()
+        options = []
+
+        for user_id, user_name, status, position in candidates[:25]:
+            status_text = status if status != "FINISHED" else f"P{position}"
+            options.append(
+                discord.SelectOption(
+                    label=user_name[:100],
+                    description=status_text[:100],
+                    value=str(user_id)
+                )
+            )
+
+        if not options:
+            options.append(discord.SelectOption(label="No candidates", value="none", description="Save race results first"))
+
+        super().__init__(
+            placeholder="Choose Driver of the Day",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="dotd_select"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        settings = get_dotd_settings()
+
+        if not settings or settings[3] != 1:
+            await interaction.response.send_message("❌ DOTD voting is closed.", ephemeral=True)
+            return
+
+        if self.values[0] == "none":
+            await interaction.response.send_message("❌ No candidates available.", ephemeral=True)
+            return
+
+        candidate_id = int(self.values[0])
+
+        cursor.execute("SELECT user_name FROM race_results WHERE user_id = ?", (candidate_id,))
+        row = cursor.fetchone()
+
+        if not row:
+            await interaction.response.send_message("❌ Candidate not found.", ephemeral=True)
+            return
+
+        candidate_name = row[0]
+
+        cursor.execute("""
+            INSERT INTO dotd_votes (user_id, user_name, candidate_id, candidate_name)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                user_name = excluded.user_name,
+                candidate_id = excluded.candidate_id,
+                candidate_name = excluded.candidate_name
+        """, (interaction.user.id, interaction.user.display_name, candidate_id, candidate_name))
+        conn.commit()
+
+        await interaction.response.send_message(f"✅ Your DOTD vote has been set to **{candidate_name}**.", ephemeral=True)
+        await update_dotd_message()
+
+
+class DOTDView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(DOTDSelect())
+
+
+async def update_dotd_message():
+    settings = get_dotd_settings()
+
+    if not settings:
+        return
+
+    race_name, channel_id, message_id, is_open, close_ts = settings
+
+    if not channel_id or not message_id:
+        return
+
+    channel = bot.get_channel(channel_id)
+
+    if not channel:
+        return
+
+    try:
+        msg = await channel.fetch_message(message_id)
+        if is_open:
+            await msg.edit(embed=create_dotd_embed(), view=DOTDView())
+        else:
+            await msg.edit(embed=create_dotd_embed(), view=None)
+    except Exception as e:
+        print(f"DOTD update error: {e}")
+
+
+async def close_dotd_if_needed():
+    settings = get_dotd_settings()
+
+    if not settings:
+        return
+
+    race_name, channel_id, message_id, is_open, close_ts = settings
+
+    if is_open == 1 and close_ts != 0 and now_ts() >= close_ts:
+        set_dotd_settings(race_name, channel_id, message_id, 0, close_ts)
+        await update_dotd_message()
+
+
+
 def create_attendance_embed():
     event = get_event()
 
@@ -838,6 +1196,8 @@ async def auto_assign_reserves(channel: discord.TextChannel | discord.Thread, ma
 
 @tasks.loop(seconds=60)
 async def reserve_checker():
+    await close_dotd_if_needed()
+
     event = get_event()
 
     if not event:
@@ -863,6 +1223,10 @@ async def reserve_checker():
 @bot.event
 async def on_ready():
     bot.add_view(AttendanceView())
+    try:
+        bot.add_view(DOTDView())
+    except Exception:
+        pass
     synced = await bot.tree.sync()
     print(f"Attendance bot online as {bot.user}")
     print(f"Synced {len(synced)} commands")
@@ -1514,6 +1878,137 @@ async def auto_reserve_assign(interaction: discord.Interaction):
     result = await auto_assign_reserves(interaction.channel, manual=True)
 
     await interaction.followup.send(result, ephemeral=True)
+
+
+@bot.tree.command(name="race_results_set", description="Admin: save official race results")
+@app_commands.describe(data="Example: 1 @Driver\\n2 @Driver\\nDNF @Driver")
+async def race_results_set(interaction: discord.Interaction, data: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    parsed = parse_results_data(data)
+
+    if not parsed:
+        await interaction.followup.send("❌ No valid results found. Use format like `1 @Driver` or `DNF @Driver`.", ephemeral=True)
+        return
+
+    cursor.execute("DELETE FROM race_results")
+    cursor.execute("DELETE FROM dotd_votes")
+    conn.commit()
+
+    created = 0
+
+    for row in parsed:
+        user_id = row["user_id"]
+        user_name = await fetch_display_name(interaction.guild, user_id)
+
+        cursor.execute("""
+            INSERT INTO race_results (position, user_id, user_name, status)
+            VALUES (?, ?, ?, ?)
+        """, (row["position"], user_id, user_name, row["status"]))
+        created += 1
+
+    conn.commit()
+
+    await interaction.followup.send(f"✅ Race results saved. Drivers saved: **{created}**", ephemeral=True)
+    await interaction.channel.send(embed=create_results_embed())
+
+
+@bot.tree.command(name="race_results_show", description="Show official race results")
+async def race_results_show(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=create_results_embed())
+
+
+@bot.tree.command(name="race_results_clear", description="Admin: clear race results")
+@app_commands.describe(confirm="Type RESET")
+async def race_results_clear(interaction: discord.Interaction, confirm: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    if confirm != "RESET":
+        await interaction.response.send_message("❌ Type exactly `RESET`.", ephemeral=True)
+        return
+
+    cursor.execute("DELETE FROM race_results")
+    cursor.execute("DELETE FROM dotd_votes")
+    conn.commit()
+
+    await interaction.response.send_message("🗑️ Race results and DOTD votes have been cleared.", ephemeral=True)
+
+
+@bot.tree.command(name="dotd_create", description="Admin: create Driver of the Day voting from race results")
+@app_commands.describe(
+    close_date="DOTD close date, e.g. 30.05.2026",
+    close_time="DOTD close time, e.g. 22:00"
+)
+async def dotd_create(interaction: discord.Interaction, close_date: str, close_time: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    cursor.execute("SELECT COUNT(*) FROM race_results")
+    count = cursor.fetchone()[0]
+
+    if count == 0:
+        await interaction.response.send_message("❌ Save race results first using `/race_results_set`.", ephemeral=True)
+        return
+
+    try:
+        close_ts = parse_race_datetime(close_date, close_time)
+    except Exception:
+        await interaction.response.send_message("❌ Invalid date/time format. Use `30.05.2026` and `22:00`.", ephemeral=True)
+        return
+
+    race_name = get_race_name()
+
+    cursor.execute("DELETE FROM dotd_votes")
+    conn.commit()
+
+    set_dotd_settings(race_name, interaction.channel.id, 0, 1, close_ts)
+
+    await interaction.response.send_message(embed=create_dotd_embed(), view=DOTDView())
+    msg = await interaction.original_response()
+
+    set_dotd_settings(race_name, msg.channel.id, msg.id, 1, close_ts)
+
+
+@bot.tree.command(name="dotd_close", description="Admin: close DOTD voting")
+async def dotd_close(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    settings = get_dotd_settings()
+
+    if not settings:
+        await interaction.response.send_message("❌ DOTD voting has not been created.", ephemeral=True)
+        return
+
+    race_name, channel_id, message_id, is_open, close_ts = settings
+    set_dotd_settings(race_name, channel_id, message_id, 0, close_ts)
+    await update_dotd_message()
+
+    await interaction.response.send_message("🔒 DOTD voting has been closed.", ephemeral=True)
+
+
+@bot.tree.command(name="dotd_results", description="Show DOTD results")
+async def dotd_results(interaction: discord.Interaction):
+    settings = get_dotd_settings()
+    race_name = settings[0] if settings else get_race_name()
+
+    embed = discord.Embed(
+        title=f"🏆 DOTD RESULTS — {race_name}",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="Results", value=create_dotd_results_text(), inline=False)
+    embed.set_footer(text="CSL Attendance System • DOTD Results")
+
+    await interaction.response.send_message(embed=embed)
+
 
 
 if not TOKEN:
