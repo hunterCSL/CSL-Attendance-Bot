@@ -694,7 +694,17 @@ def result_icon(position: int, status: str):
     if position == 3:
         return "🥉"
 
-    return f"**P{position}**"
+    number_icons = {
+        4: "4️⃣",
+        5: "5️⃣",
+        6: "6️⃣",
+        7: "7️⃣",
+        8: "8️⃣",
+        9: "9️⃣",
+        10: "🔟"
+    }
+
+    return number_icons.get(position, f"**P{position}**")
 
 
 def create_results_embed_fast():
@@ -711,51 +721,67 @@ def create_results_embed_fast():
     rows = cursor.fetchall()
 
     embed = discord.Embed(
-        title=f"🏁 OFFICIAL RACE RESULTS — {race_name}",
+        title=f"🏁 OFFICIAL RACE RESULTS",
+        description=f"**{race_name}**",
         color=discord.Color.blurple()
     )
 
     if not rows:
-        embed.description = "No race results have been saved yet."
+        embed.description = f"**{race_name}**\n\nNo race results have been saved yet."
         return embed
 
-    finished_lines = []
-    other_lines = []
+    classified = []
+    dnf = []
+    dns = []
+    dsq = []
 
     for position, user_id, user_name, status in rows:
         name = user_name or f"User {user_id}"
+        status = str(status).upper()
 
         if status == "FINISHED":
-            if position == 1:
-                icon = "🥇"
-            elif position == 2:
-                icon = "🥈"
-            elif position == 3:
-                icon = "🥉"
-            else:
-                icon = f"P{position}"
-
-            finished_lines.append(f"{icon} **{name}**")
+            classified.append(f"{result_icon(position, status)} **P{position}** — **{name}**")
+        elif status == "DNF":
+            dnf.append(f"❌ **{name}**")
+        elif status == "DNS":
+            dns.append(f"🚫 **{name}**")
+        elif status == "DSQ":
+            dsq.append(f"⚫ **{name}**")
         else:
-            icon = "❌" if status == "DNF" else "🚫" if status == "DNS" else "⚫"
-            other_lines.append(f"{icon} **{status}** — **{name}**")
+            dnf.append(f"❔ **{status}** — **{name}**")
 
-    if finished_lines:
+    if classified:
         embed.add_field(
-            name="Classified Results",
-            value="\n".join(finished_lines)[:1024],
+            name="🏆 Classified Results",
+            value="\n".join(classified)[:1024],
             inline=False
         )
 
-    if other_lines:
+    if dnf:
         embed.add_field(
-            name="DNF / DNS / DSQ",
-            value="\n".join(other_lines)[:1024],
-            inline=False
+            name="❌ DNF",
+            value="\n".join(dnf)[:1024],
+            inline=True
         )
 
-    embed.set_footer(text="CSL Attendance System • Race Results")
+    if dns:
+        embed.add_field(
+            name="🚫 DNS",
+            value="\n".join(dns)[:1024],
+            inline=True
+        )
+
+    if dsq:
+        embed.add_field(
+            name="⚫ DSQ",
+            value="\n".join(dsq)[:1024],
+            inline=True
+        )
+
+    embed.add_field(name="👥 Drivers Listed", value=f"**{len(rows)}**", inline=True)
+    embed.set_footer(text="CSL Attendance System • Official Race Results")
     return embed
+
 
 
 def create_results_embed():
@@ -834,14 +860,18 @@ def get_dotd_candidates():
     return cursor.fetchall()
 
 
-def create_dotd_results_text():
+def get_dotd_vote_rows():
     cursor.execute("""
         SELECT candidate_id, candidate_name, COUNT(*) as votes
         FROM dotd_votes
         GROUP BY candidate_id, candidate_name
         ORDER BY votes DESC, candidate_name ASC
     """)
-    rows = cursor.fetchall()
+    return cursor.fetchall()
+
+
+def create_dotd_results_text():
+    rows = get_dotd_vote_rows()
 
     if not rows:
         return "No DOTD votes yet."
@@ -851,10 +881,39 @@ def create_dotd_results_text():
 
     for index, (candidate_id, candidate_name, votes) in enumerate(rows, start=1):
         percent = round((votes / total_votes) * 100, 1) if total_votes > 0 else 0
-        medal = "🥇" if index == 1 else "🥈" if index == 2 else "🥉" if index == 3 else f"**{index}.**"
-        text += f"{medal} **{candidate_name}** — **{votes}** vote(s) ({percent}%)\n"
+
+        if index == 1:
+            medal = "🥇"
+        elif index == 2:
+            medal = "🥈"
+        elif index == 3:
+            medal = "🥉"
+        else:
+            medal = f"**{index}.**"
+
+        text += f"{medal} **{candidate_name}**\n"
+        text += f"🗳️ **{votes}** vote(s) • **{percent}%**\n\n"
 
     return text[:1024]
+
+
+def create_dotd_winner_text():
+    rows = get_dotd_vote_rows()
+
+    if not rows:
+        return "No winner yet."
+
+    top_votes = rows[0][2]
+    winners = [row for row in rows if row[2] == top_votes]
+    total_votes = sum(row[2] for row in rows)
+    percent = round((top_votes / total_votes) * 100, 1) if total_votes > 0 else 0
+
+    if len(winners) == 1:
+        return f"🥇 **{winners[0][1]}**\n🗳️ **{top_votes}** vote(s) • **{percent}%**"
+
+    names = ", ".join([f"**{row[1]}**" for row in winners])
+    return f"🤝 Tie: {names}\n🗳️ **{top_votes}** vote(s) each • **{percent}%**"
+
 
 
 def create_dotd_embed():
@@ -866,8 +925,8 @@ def create_dotd_embed():
     candidates = get_dotd_candidates()
 
     embed = discord.Embed(
-        title=f"🏆 DRIVER OF THE DAY — {race_name}",
-        description="Vote for your Driver of the Day using the select menu below.",
+        title=f"🏆 DRIVER OF THE DAY",
+        description=f"**{race_name}**\nVote for your Driver of the Day using the select menu below.",
         color=discord.Color.gold() if is_open else discord.Color.dark_gold()
     )
 
@@ -877,18 +936,29 @@ def create_dotd_embed():
     status = "🟢 OPEN" if is_open else "🔴 CLOSED"
     embed.add_field(name="📊 Status", value=f"**{status}**", inline=True)
 
+    cursor.execute("SELECT COUNT(*) FROM dotd_votes")
+    total_votes = cursor.fetchone()[0] or 0
+    embed.add_field(name="🗳️ Total Votes", value=f"**{total_votes}**", inline=True)
+
     if not candidates:
         embed.add_field(name="Candidates", value="No candidates. Save race results first.", inline=False)
     else:
         text = ""
         for user_id, user_name, status, position in candidates:
             status_text = status if status != "FINISHED" else f"P{position}"
-            text += f"• **{user_name}** — `{status_text}`\n"
-        embed.add_field(name="Candidates", value=text[:1024], inline=False)
+            icon = result_icon(position, status)
+            text += f"{icon} **{user_name}** — `{status_text}`\n"
+        embed.add_field(name="🏁 Candidates", value=text[:1024], inline=False)
 
-    embed.add_field(name="Current Results", value=create_dotd_results_text(), inline=False)
+    if is_open:
+        embed.add_field(name="Live Results", value=create_dotd_results_text(), inline=False)
+    else:
+        embed.add_field(name="🏆 Winner", value=create_dotd_winner_text(), inline=False)
+        embed.add_field(name="Final Results", value=create_dotd_results_text(), inline=False)
+
     embed.set_footer(text="CSL Attendance System • DOTD Voting")
     return embed
+
 
 
 class DOTDSelect(discord.ui.Select):
@@ -2125,11 +2195,18 @@ async def dotd_results(interaction: discord.Interaction):
     settings = get_dotd_settings()
     race_name = settings[0] if settings else get_race_name()
 
+    cursor.execute("SELECT COUNT(*) FROM dotd_votes")
+    total_votes = cursor.fetchone()[0] or 0
+
     embed = discord.Embed(
-        title=f"🏆 DOTD RESULTS — {race_name}",
+        title=f"🏆 DRIVER OF THE DAY RESULTS",
+        description=f"**{race_name}**",
         color=discord.Color.gold()
     )
-    embed.add_field(name="Results", value=create_dotd_results_text(), inline=False)
+
+    embed.add_field(name="🏆 Winner", value=create_dotd_winner_text(), inline=False)
+    embed.add_field(name="📊 Full Results", value=create_dotd_results_text(), inline=False)
+    embed.add_field(name="🗳️ Total Votes", value=f"**{total_votes}**", inline=True)
     embed.set_footer(text="CSL Attendance System • DOTD Results")
 
     await interaction.response.send_message(embed=embed)
